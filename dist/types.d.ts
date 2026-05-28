@@ -1,5 +1,6 @@
 export type LifecycleMode = "lazy" | "eager" | "keep-alive";
 export interface ServerConfig {
+    type?: "stdio" | "http" | "sse";
     command?: string;
     args?: string[];
     env?: Record<string, string>;
@@ -10,27 +11,48 @@ export interface ServerConfig {
     lifecycle?: LifecycleMode;
     idleTimeout?: number;
     disabled?: boolean;
+    refreshOnStartup?: boolean;
+    connectTimeoutMs?: number;
+    requestTimeoutMs?: number;
+    closeTimeoutMs?: number;
 }
 export interface GlobalSettings {
     idleTimeout?: number;
     cacheTtlDays?: number;
     toolSearchLimit?: number;
-    enableFuseSearch?: boolean;
+    metadataBootstrap?: "background" | "off";
+    debug?: boolean;
+    connectTimeoutMs?: number;
+    requestTimeoutMs?: number;
+    closeTimeoutMs?: number;
 }
 export interface AdapterConfig {
     version: number;
     settings?: GlobalSettings;
     mcpServers: Record<string, ServerConfig>;
 }
-export interface McpTool {
-    name: string;
-    description?: string;
-    inputSchema?: any;
+export interface ConnectOptions {
+    connectTimeoutMs?: number;
+    requestTimeoutMs?: number;
+    closeTimeoutMs?: number;
 }
+export interface BootstrapStatus {
+    running: boolean;
+    startedAt?: number;
+    finishedAt?: number;
+    total: number;
+    completed: number;
+    current?: string;
+    errors: Array<{
+        server: string;
+        message: string;
+    }>;
+}
+export type JsonSchema = Record<string, unknown>;
 export interface CachedTool {
     name: string;
     description?: string;
-    inputSchema?: any;
+    inputSchema?: JsonSchema;
 }
 export interface ServerCacheEntry {
     configHash: string;
@@ -47,5 +69,5 @@ export interface ToolSearchDoc {
     name: string;
     qualifiedName: string;
     description?: string;
-    searchText: string;
+    inputSchema?: JsonSchema;
 }

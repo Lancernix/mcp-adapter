@@ -12,6 +12,14 @@ export declare function saveConfig(config: AdapterConfig): void;
  */
 export declare function normalize(str: string): string;
 /**
+ * 构建子进程环境变量，过滤 process.env 中的 undefined 值
+ */
+export declare function buildChildEnv(extra?: Record<string, string>): Record<string, string>;
+/**
+ * 解析 cwd 路径，支持 ~ 和 ~/path 展开
+ */
+export declare function resolveCwd(cwd?: string): string;
+/**
  * 根据输入的别名、或者是原始名字来精准定位真实的 server 键值
  */
 export declare function resolveServerName(input: string, servers: Record<string, ServerConfig>): string | null;
