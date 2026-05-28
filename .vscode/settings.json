@@ -1,0 +1,25 @@
+{
+  "js/ts.tsdk.path": "./node_modules/typescript/lib",
+  "editor.codeActionsOnSave": {
+    "source.fixAll.biome": "explicit",
+    "source.organizeImports.biome": "explicit",
+    "source.removeUnused.ts": "explicit"
+  },
+  "editor.formatOnSave": true,
+  "eslint.enable": false,
+  "prettier.enable": true,
+  "biome.enabled": true,
+  "js/ts.updateImportsOnFileMove.enabled": "always",
+  "[typescript]": {
+    "editor.defaultFormatter": "biomejs.biome"
+  },
+  "[javascript]": {
+    "editor.defaultFormatter": "biomejs.biome"
+  },
+  "[json]": {
+    "editor.defaultFormatter": "biomejs.biome"
+  },
+  "[jsonc]": {
+    "editor.defaultFormatter": "biomejs.biome"
+  }
+}
