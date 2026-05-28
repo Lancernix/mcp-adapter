@@ -1,4 +1,6 @@
 // lifecycle.ts - Idle connection timeout sweeper
+
+import { writeLog } from "./logger.js";
 import type { McpServerManager } from "./server-manager.js";
 import type { AdapterConfig } from "./types.js";
 
@@ -20,14 +22,16 @@ export class McpLifecycleManager {
     if (this.timer) {
       clearInterval(this.timer);
     }
-    
+
     this.timer = setInterval(() => {
       this.sweepIdleConnections();
     }, intervalMs);
-    
+
     // 允许 Node 进程在只有 sweeper 活跃时正常退出，不强制常驻挂起
     this.timer.unref();
-    process.stderr.write(`[Lifecycle] 闲置连接扫描器已挂载并启动。(轮询周期: ${intervalMs / 1000} 秒)\n`);
+    writeLog(
+      `[Lifecycle] 闲置连接扫描器已挂载并启动。(轮询周期: ${intervalMs / 1000} 秒)\n`,
+    );
   }
 
   /**
@@ -50,7 +54,7 @@ export class McpLifecycleManager {
 
       for (const serverName of Object.keys(servers)) {
         const srvConfig = servers[serverName];
-        
+
         // 只有 lazy 模式需要做超时杀进程
         const mode = srvConfig.lifecycle || "lazy";
         if (mode !== "lazy") continue;
@@ -61,10 +65,21 @@ export class McpLifecycleManager {
 
         // 如果该 server 已经在闲置中，则平滑杀死释放内存
         if (this.serverManager.isIdle(serverName, timeoutMs)) {
-          process.stderr.write(`[Lifecycle] 检查发现真实 MCP 服务 [${serverName}] 已闲置超过 ${timeoutMinutes} 分钟。正在执行自动降温释放...\n`);
-          await this.serverManager.close(serverName).catch((err) => {
-            process.stderr.write(`[Lifecycle-Error] 平滑销毁 [${serverName}] 失败: ${err.message}\n`);
-          });
+          writeLog(
+            `[Lifecycle] 检查发现真实 MCP 服务 [${serverName}] 已闲置超过 ${timeoutMinutes} 分钟。正在执行自动降温释放...\n`,
+          );
+          const closeTimeoutMs =
+            srvConfig.closeTimeoutMs ??
+            this.config.settings?.closeTimeoutMs ??
+            10000;
+
+          await this.serverManager
+            .close(serverName, closeTimeoutMs)
+            .catch((err) => {
+              writeLog(
+                `[Lifecycle-Error] 平滑销毁 [${serverName}] 失败: ${err.message}\n`,
+              );
+            });
         }
       }
     } finally {

@@ -1,12 +1,21 @@
 // cache-manager.ts - Cache management for @lancernix/mcp-adapter
-import * as fs from "fs";
-import * as path from "path";
-import { createHash } from "crypto";
-import type { MetadataCache, ServerCacheEntry, ServerConfig, CachedTool } from "./types.js";
-import { getCachePath, getMcpAdapterHome } from "./config-manager.js";
+
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import { ensureDirs, getCachePath } from "./config-manager.js";
+import type {
+  AdapterConfig,
+  MetadataCache,
+  ServerCacheEntry,
+  ServerConfig,
+} from "./types.js";
 
 export const CACHE_VERSION = 1;
 export const CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 天
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
 
 export function loadMetadataCache(): MetadataCache | null {
   const cachePath = getCachePath();
@@ -14,10 +23,20 @@ export function loadMetadataCache(): MetadataCache | null {
     return null;
   }
   try {
+    // 修正已有 cache 文件的权限，确保不含 world/group 可读
+    try {
+      fs.chmodSync(cachePath, 0o600);
+    } catch {}
+
     const raw = fs.readFileSync(cachePath, "utf-8");
-    const parsed = JSON.parse(raw) as MetadataCache;
-    if (parsed && parsed.version === CACHE_VERSION && parsed.servers) {
-      return parsed;
+    const parsed = JSON.parse(raw) as unknown;
+
+    if (
+      isPlainObject(parsed) &&
+      parsed.version === CACHE_VERSION &&
+      isPlainObject(parsed.servers)
+    ) {
+      return parsed as unknown as MetadataCache;
     }
     return null;
   } catch {
@@ -27,16 +46,15 @@ export function loadMetadataCache(): MetadataCache | null {
 
 /**
  * 原子、安全写缓存：使用 temp 文件 + fs.renameSync
+ * 内部串行化写操作，防止并发刷新导致 lost update。
  */
-export function saveMetadataCache(cache: MetadataCache): void {
-  const cachePath = getCachePath();
-  const home = getMcpAdapterHome();
-  
-  if (!fs.existsSync(home)) {
-    fs.mkdirSync(home, { recursive: true, mode: 0o700 });
-  }
+let cacheWriteQueue: Promise<void> = Promise.resolve();
 
-  let merged: MetadataCache = { version: CACHE_VERSION, servers: {} };
+function doSaveMetadataCache(cache: MetadataCache): void {
+  const cachePath = getCachePath();
+  ensureDirs();
+
+  const merged: MetadataCache = { version: CACHE_VERSION, servers: {} };
   const existing = loadMetadataCache();
   if (existing) {
     merged.servers = { ...existing.servers };
@@ -47,18 +65,38 @@ export function saveMetadataCache(cache: MetadataCache): void {
 
   const tmpPath = `${cachePath}.${process.pid}.${Date.now()}.tmp`;
   try {
-    fs.writeFileSync(
-      tmpPath, 
-      JSON.stringify(merged, null, 2), 
-      { encoding: "utf-8", mode: 0o600 }
-    );
+    fs.writeFileSync(tmpPath, JSON.stringify(merged, null, 2), {
+      encoding: "utf-8",
+      mode: 0o600,
+    });
     fs.renameSync(tmpPath, cachePath);
-  } catch (err: any) {
+    try {
+      fs.chmodSync(cachePath, 0o600);
+    } catch {}
+  } catch (err) {
     if (fs.existsSync(tmpPath)) {
-      try { fs.unlinkSync(tmpPath); } catch {}
+      try {
+        fs.unlinkSync(tmpPath);
+      } catch {}
     }
-    throw new Error(`原子保存 cache.json 失败: ${err.message}`);
+    throw new Error(
+      `原子保存 cache.json 失败: ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
+}
+
+export function saveMetadataCache(cache: MetadataCache): Promise<void> {
+  const writeTask = cacheWriteQueue
+    .catch(() => {
+      // 吞掉上一轮错误，避免队列永久 rejected
+    })
+    .then(() => doSaveMetadataCache(cache));
+
+  cacheWriteQueue = writeTask.catch(() => {
+    // 保持队列链路健康；错误仍由 writeTask 返回给当前调用方
+  });
+
+  return writeTask;
 }
 
 /**
@@ -70,40 +108,85 @@ export function stableStringify(value: unknown): string {
     return serialized === undefined ? "undefined" : serialized;
   }
   if (Array.isArray(value)) {
-    return `[${value.map(v => stableStringify(v)).join(",")}]`;
+    return `[${value.map((v) => stableStringify(v)).join(",")}]`;
   }
   const obj = value as Record<string, unknown>;
   const keys = Object.keys(obj).sort();
-  return `{${keys.map(k => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(",")}}`;
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(",")}}`;
 }
 
+// adapter 元数据字段——不影响底层 server 暴露什么工具，哈希计算时排除
+const META_KEYS = new Set([
+  "aliases",
+  "lifecycle",
+  "disabled",
+  "idleTimeout",
+  "refreshOnStartup",
+  "connectTimeoutMs",
+  "requestTimeoutMs",
+  "closeTimeoutMs",
+]);
+
 /**
- * 计算哈希指纹，仅对可能改变工具定义的字段求和
+ * 计算哈希指纹：遍历 ServerConfig 所有字段，仅排除 adapter 元数据。
+ * 黑名单策略确保新增连接相关字段（如 type、caCert）自动纳入，无需手动维护白名单。
  */
 export function computeServerHash(definition: ServerConfig): string {
-  const identity = {
-    command: definition.command,
-    args: definition.args,
-    env: definition.env,
-    cwd: definition.cwd,
-    url: definition.url,
-    headers: definition.headers
-  };
+  const identity: Record<string, unknown> = {};
+  for (const key of Object.keys(definition) as (keyof ServerConfig)[]) {
+    if (META_KEYS.has(key)) continue;
+    identity[key] = definition[key];
+  }
   const normalized = stableStringify(identity);
   return createHash("sha256").update(normalized).digest("hex");
 }
 
+function isValidCacheEntry(entry: unknown): entry is ServerCacheEntry {
+  return (
+    !!entry &&
+    typeof entry === "object" &&
+    typeof (entry as ServerCacheEntry).configHash === "string" &&
+    typeof (entry as ServerCacheEntry).cachedAt === "number" &&
+    Array.isArray((entry as ServerCacheEntry).tools)
+  );
+}
+
 /**
- * 验证当前服务器缓存条目是否在 1.指纹、2.生存期、3.版本上完好有效
+ * 验证当前服务器缓存条目是否在 1.结构、2.指纹、3.生存期上完好有效
  */
 export function isServerCacheValid(
   entry: ServerCacheEntry | undefined,
   definition: ServerConfig,
-  maxAgeMs: number = CACHE_MAX_AGE_MS
+  maxAgeMs: number = CACHE_MAX_AGE_MS,
 ): boolean {
-  if (!entry) return false;
+  if (!isValidCacheEntry(entry)) return false;
   if (entry.configHash !== computeServerHash(definition)) return false;
-  if (!entry.cachedAt || typeof entry.cachedAt !== "number") return false;
   if (maxAgeMs > 0 && Date.now() - entry.cachedAt > maxAgeMs) return false;
   return true;
+}
+
+/**
+ * 从全量缓存中过滤出 configHash 有效、TTL 未过期、且未被 disabled 的 server 缓存条目。
+ * 确保 search_tools / describe_tool / locateTool 只使用当前配置对应的有效缓存。
+ */
+export function getValidCachedServers(
+  config: AdapterConfig,
+  cache: MetadataCache | null,
+): Record<string, ServerCacheEntry> {
+  if (!cache?.servers) return {};
+
+  const result: Record<string, ServerCacheEntry> = {};
+  const ttlDays = config.settings?.cacheTtlDays ?? 7;
+  const maxAgeMs = ttlDays * 24 * 60 * 60 * 1000;
+
+  for (const [serverName, serverConfig] of Object.entries(config.mcpServers)) {
+    if (serverConfig.disabled) continue;
+
+    const entry = cache.servers[serverName];
+    if (isServerCacheValid(entry, serverConfig, maxAgeMs)) {
+      result[serverName] = entry;
+    }
+  }
+
+  return result;
 }
