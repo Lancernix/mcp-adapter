@@ -1279,17 +1279,9 @@ async function main() {
     const dryRun = args.includes("--dry-run");
 
     if (!fromPath) {
-      const home = os.homedir();
-      // 尝试常见的默认路径
-      const candidates = [
-        path.join(home, ".claude", "settings.json"),
-        path.join(home, ".claude.json"),
-      ];
-      for (const candidate of candidates) {
-        if (fs.existsSync(candidate)) {
-          fromPath = candidate;
-          break;
-        }
+      const candidate = path.join(os.homedir(), ".claude.json");
+      if (fs.existsSync(candidate)) {
+        fromPath = candidate;
       }
     }
 

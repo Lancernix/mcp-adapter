@@ -1,6 +1,6 @@
 {
   "name": "@lancernix/mcp-adapter",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "标准通用 MCP 延迟路由网关，物理拦截海量工具定义，节省大模型上下文开销",
   "type": "module",
   "bin": {

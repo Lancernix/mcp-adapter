@@ -102,19 +102,7 @@
 
 ## 安装与配置
 
-### npm 全局安装（推荐）
-
-```bash
-npm install -g @lancernix/mcp-adapter
-```
-
-安装后直接运行：
-
-```bash
-mcp-adapter
-```
-
-### npx 直接使用（无需安装）
+### npx 直接使用（推荐）
 
 在 MCP 客户端配置中直接使用 npx，无需提前安装：
 
@@ -127,6 +115,20 @@ mcp-adapter
     }
   }
 }
+```
+
+> npx 首次运行后会将包缓存到 `~/.npm/_npx/`，后续启动直接使用缓存，不会重复下载。
+
+### npm 全局安装
+
+```bash
+npm install -g @lancernix/mcp-adapter
+```
+
+安装后直接运行：
+
+```bash
+mcp-adapter
 ```
 
 ### 源码克隆并构建
@@ -284,19 +286,7 @@ node dist/index.js import
 
 ### 在 Claude Code 中接入
 
-**npm 全局安装后：**
-
-```json
-{
-  "mcpServers": {
-    "mcp-adapter": {
-      "command": "mcp-adapter"
-    }
-  }
-}
-```
-
-**npx 直接使用：**
+**npx 直接使用（推荐）：**
 
 ```json
 {
@@ -304,6 +294,18 @@ node dist/index.js import
     "mcp-adapter": {
       "command": "npx",
       "args": ["-y", "@lancernix/mcp-adapter"]
+    }
+  }
+}
+```
+
+**npm 全局安装后：**
+
+```json
+{
+  "mcpServers": {
+    "mcp-adapter": {
+      "command": "mcp-adapter"
     }
   }
 }
