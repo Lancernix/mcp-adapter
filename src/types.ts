@@ -82,3 +82,15 @@ export interface ToolSearchDoc {
   description?: string;
   inputSchema?: JsonSchema;
 }
+
+// ---- Server hint resolution ----
+
+export type ServerResolveConfidence = "high" | "medium" | "low" | "none";
+
+export interface ServerResolveResult {
+  original: string;
+  resolvedServer: string | null;
+  confidence: ServerResolveConfidence;
+  candidates: string[];
+  reason: string;
+}

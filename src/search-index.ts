@@ -2,6 +2,8 @@
 
 import type { IFuseOptions } from "fuse.js";
 import Fuse from "fuse.js";
+import type { Bm25Result } from "./bm25-index.js";
+import { Bm25Index } from "./bm25-index.js";
 import {
   findServersInText,
   normalizeForSearch,
@@ -15,12 +17,29 @@ import type {
   ToolSearchDoc,
 } from "./types.js";
 
+// ---- Helpers ----
+
+/**
+ * Graded hit weight: exact token match > prefix match > substring match.
+ * Reduces false positives for short tokens (e.g. "sql" matching "nosql").
+ */
+function tokenHitWeightForField(
+  fieldText: string,
+  fieldTokens: string[],
+  token: string,
+): number {
+  if (fieldTokens.includes(token)) return 1.0;
+  if (fieldTokens.some((t) => t.startsWith(token))) return 0.6;
+  if (fieldText.includes(token)) return 0.3;
+  return 0;
+}
+
 // ---- Fuse extended types ----
 
 type FuseOptionsWithTokenSearch<T> = IFuseOptions<T> & {
   useTokenSearch?: boolean;
   tokenMatch?: "any" | "all";
-  tokenize?: (text: string) => string[];
+  tokenize?: RegExp | ((text: string) => string[]);
 };
 
 const FUSE_OPTIONS: FuseOptionsWithTokenSearch<ToolSearchDoc> = {
@@ -49,7 +68,12 @@ const SCOPED_FUSE_OPTIONS: FuseOptionsWithTokenSearch<ToolSearchDoc> = {
 
 // ---- types ----
 
-export type ToolSearchMatchKind = "fuzzy" | "token_fallback" | "server_browse";
+export type ToolSearchMatchKind =
+  | "hybrid"
+  | "bm25"
+  | "fuzzy"
+  | "token_fallback"
+  | "server_browse";
 
 export interface ToolSearchResult {
   server: string;
@@ -62,132 +86,14 @@ export interface ToolSearchResult {
   matchReasons?: string[];
 }
 
-// ---- rerank ----
-
-function scoreFuseResult(
-  doc: ToolSearchDoc,
-  query: string,
-  rawFuseScore: number | undefined,
-  options?: { scoped?: boolean; ignoreServerFields?: boolean },
-): { score: number; reasons: string[] } {
-  const reasons: string[] = [];
-
-  const fuseScore = Math.round((1 - (rawFuseScore ?? 1)) * 60);
-  let score = fuseScore;
-
-  if (fuseScore > 0) {
-    reasons.push(`Fuse token 匹配 ${fuseScore}/60`);
-  }
-
-  const queryTokens = tokenizeForSearch(query);
-
-  const nameText = normalizeForSearch(doc.name);
-  const qualifiedText = normalizeForSearch(doc.qualifiedName);
-  const descText = normalizeForSearch(doc.description || "");
-  const serverText = normalizeForSearch(doc.server);
-  const aliasText = normalizeForSearch(doc.serverAliases.join(" "));
-  const normalizedQuery = normalizeForSearch(query);
-
-  let nameHits = 0;
-  let qualifiedHits = 0;
-  let descHits = 0;
-  let serverHits = 0;
-  let aliasHits = 0;
-
-  for (const token of queryTokens) {
-    if (nameText.includes(token)) nameHits++;
-    if (descText.includes(token)) descHits++;
-
-    if (!options?.ignoreServerFields) {
-      if (qualifiedText.includes(token)) qualifiedHits++;
-      if (serverText.includes(token)) serverHits++;
-      if (aliasText.includes(token)) aliasHits++;
-    }
-  }
-
-  // 1. 工具名命中
-  if (nameHits > 0) {
-    const boost = Math.min(25, nameHits * 10);
-    score += boost;
-    reasons.push(`工具名命中 ${nameHits} 个查询 token (+${boost})`);
-  }
-
-  // 2. qualifiedName 命中
-  if (qualifiedHits > 0) {
-    const boost = Math.min(10, qualifiedHits * 4);
-    score += boost;
-    reasons.push(`完整工具名命中 ${qualifiedHits} 个查询 token (+${boost})`);
-  }
-
-  // 3. server alias 命中
-  if (aliasHits > 0) {
-    const boost = Math.min(15, aliasHits * 8);
-    score += boost;
-    reasons.push(`服务别名命中 ${aliasHits} 个查询 token (+${boost})`);
-  }
-
-  // 4. server name 命中
-  if (serverHits > 0) {
-    const boost = Math.min(8, serverHits * 4);
-    score += boost;
-    reasons.push(`服务名命中 ${serverHits} 个查询 token (+${boost})`);
-  }
-
-  // 5. description 命中
-  if (descHits > 0) {
-    const boost = Math.min(12, descHits * 4);
-    score += boost;
-    reasons.push(`描述命中 ${descHits} 个查询 token (+${boost})`);
-  }
-
-  // 6. 完整 query 被工具名包含
-  if (normalizedQuery && nameText.includes(normalizedQuery)) {
-    score += 15;
-    reasons.push("工具名包含完整查询 (+15)");
-  }
-
-  // 7. scoped 搜索轻微加分
-  if (options?.scoped) {
-    score += 5;
-    reasons.push("已限定服务范围 (+5)");
-  }
-
-  // 8. 仅 description 命中，降权
-  const strongHit =
-    nameHits > 0 ||
-    aliasHits > 0 ||
-    serverHits > 0 ||
-    normalizedQuery.includes(nameText) ||
-    nameText.includes(normalizedQuery);
-
-  if (!strongHit && descHits > 0) {
-    score -= 8;
-    score = Math.min(score, options?.scoped ? 55 : 50);
-    reasons.push("仅描述命中，降低置信度并限制最高分 (-8, cap)");
-  }
-
-  // 9. 零字段命中，降权
-  if (
-    nameHits === 0 &&
-    qualifiedHits === 0 &&
-    descHits === 0 &&
-    serverHits === 0 &&
-    aliasHits === 0
-  ) {
-    score -= 15;
-    reasons.push("未命中可解释字段，降低置信度 (-15)");
-  }
-
-  score = Math.max(0, Math.min(100, Math.round(score)));
-
-  return { score, reasons };
-}
-
 // ---- SearchIndex ----
 
 export class SearchIndex {
   private fuse: Fuse<ToolSearchDoc> | null = null;
+  private bm25: Bm25Index = new Bm25Index();
   private documents: ToolSearchDoc[] = [];
+  private tokenDf: Map<string, number> = new Map();
+  private docCount: number = 0;
 
   buildIndex(
     servers: Record<string, ServerConfig>,
@@ -221,9 +127,39 @@ export class SearchIndex {
         this.documents,
         FUSE_OPTIONS as IFuseOptions<ToolSearchDoc>,
       );
+      this.bm25.build(this.documents);
+      this.computeTokenDf();
     } else {
       this.fuse = null;
+      this.bm25.build([]);
+      this.tokenDf.clear();
+      this.docCount = 0;
     }
+  }
+
+  private computeTokenDf(): void {
+    this.tokenDf.clear();
+    this.docCount = this.documents.length;
+
+    for (const doc of this.documents) {
+      const text = [
+        doc.name,
+        doc.qualifiedName,
+        doc.description || "",
+        doc.server,
+        ...doc.serverAliases,
+      ].join(" ");
+      const tokens = new Set(tokenizeForSearch(text));
+      for (const token of tokens) {
+        this.tokenDf.set(token, (this.tokenDf.get(token) ?? 0) + 1);
+      }
+    }
+  }
+
+  private idf(token: string): number {
+    const df = this.tokenDf.get(token) ?? 0;
+    if (df === 0) return 1.5;
+    return Math.log((this.docCount + 1) / (df + 1)) + 1;
   }
 
   search(
@@ -234,7 +170,7 @@ export class SearchIndex {
     if (!this.fuse) return [];
 
     let candidates = this.documents;
-    let scoped = false;
+    let scopeMode: "none" | "single" | "multi" = "none";
     let searchQuery = query;
     let functionQueryEmpty = false;
 
@@ -247,7 +183,7 @@ export class SearchIndex {
             (alias) => alias.toLowerCase() === resolved.toLowerCase(),
           ),
       );
-      scoped = true;
+      scopeMode = "single";
 
       const first = candidates[0];
       if (first) {
@@ -268,7 +204,7 @@ export class SearchIndex {
       if (mentionedServers.length === 1) {
         const serverName = mentionedServers[0];
         candidates = this.documents.filter((doc) => doc.server === serverName);
-        scoped = true;
+        scopeMode = "single";
 
         const first = candidates[0];
         if (first) {
@@ -287,13 +223,15 @@ export class SearchIndex {
         candidates = this.documents.filter((doc) =>
           mentionedServers.includes(doc.server),
         );
-        scoped = true;
+        scopeMode = "multi";
       }
     }
 
     if (candidates.length === 0) return [];
 
-    if (scoped && functionQueryEmpty) {
+    const isScoped = scopeMode !== "none";
+
+    if (isScoped && functionQueryEmpty) {
       return this.browseDocs(
         candidates,
         limit,
@@ -301,10 +239,17 @@ export class SearchIndex {
       );
     }
 
-    const fuseOptions = scoped ? SCOPED_FUSE_OPTIONS : FUSE_OPTIONS;
+    // BM25 recall
+    const bm25Results = this.bm25.search(searchQuery, candidates, limit * 4);
+    const maxBm25Score =
+      bm25Results.length > 0 ? Math.max(...bm25Results.map((r) => r.score)) : 0;
+
+    // Fuse recall: only single-server scope uses SCOPED_FUSE_OPTIONS (ignore server fields)
+    const fuseOptions =
+      scopeMode === "single" ? SCOPED_FUSE_OPTIONS : FUSE_OPTIONS;
 
     let currentFuse = this.fuse;
-    if (scoped || candidates.length < this.documents.length) {
+    if (isScoped || candidates.length < this.documents.length) {
       currentFuse = new Fuse<ToolSearchDoc>(
         candidates,
         fuseOptions as IFuseOptions<ToolSearchDoc>,
@@ -312,36 +257,149 @@ export class SearchIndex {
     }
 
     const rawResults = currentFuse.search(searchQuery);
+    const scoringQuery = isScoped && searchQuery.trim() ? searchQuery : query;
 
-    const scoringQuery = scoped && searchQuery.trim() ? searchQuery : query;
+    // Merge by qualifiedName
+    type MergeEntry = {
+      doc: ToolSearchDoc;
+      bm25Result?: Bm25Result;
+      fuseScore?: number;
+      sources: Set<string>;
+    };
 
-    if (rawResults.length === 0) {
-      return this.tokenMatchFallback(scoringQuery, candidates, limit, {
-        scoped,
-        ignoreServerFields: scoped,
+    const merged = new Map<string, MergeEntry>();
+
+    for (const r of bm25Results) {
+      merged.set(r.doc.qualifiedName, {
+        doc: r.doc,
+        bm25Result: r,
+        sources: new Set(["bm25"]),
       });
     }
 
-    const reranked = rawResults.map((res) => {
-      const doc = res.item;
-      const scored = scoreFuseResult(doc, scoringQuery, res.score, {
-        scoped,
-        ignoreServerFields: scoped,
+    for (const r of rawResults) {
+      const existing = merged.get(r.item.qualifiedName);
+      if (existing) {
+        existing.fuseScore = r.score;
+        existing.sources.add("fuse");
+      } else {
+        merged.set(r.item.qualifiedName, {
+          doc: r.item,
+          fuseScore: r.score,
+          sources: new Set(["fuse"]),
+        });
+      }
+    }
+
+    // Token fallback if too few results or no BM25 match
+    const hasBm25Match = [...merged.values()].some((c) =>
+      c.sources.has("bm25"),
+    );
+    const needsTokenFallback =
+      merged.size < Math.min(limit, 5) || !hasBm25Match;
+
+    if (needsTokenFallback) {
+      const tokenResults = this.tokenMatchFallbackRaw(
+        scoringQuery,
+        candidates,
+        { scoped: isScoped, ignoreServerFields: scopeMode === "single" },
+      );
+      for (const tr of tokenResults) {
+        if (!merged.has(tr.doc.qualifiedName)) {
+          merged.set(tr.doc.qualifiedName, {
+            doc: tr.doc,
+            sources: new Set(["token"]),
+          });
+        }
+      }
+    }
+
+    // Unified rerank
+    const reranked = [...merged.values()].map((c) => {
+      // BM25 normalized: 0-45
+      const bm25Norm =
+        c.bm25Result && maxBm25Score > 0
+          ? Math.min(45, (c.bm25Result.score / maxBm25Score) * 45)
+          : 0;
+
+      // Fuse normalized: 0-20
+      const fuseNorm =
+        c.fuseScore !== undefined
+          ? Math.max(0, Math.min(20, (1 - c.fuseScore) * 20))
+          : 0;
+
+      // IDF-weighted field hits
+      const field = this.computeFieldHits(c.doc, scoringQuery, {
+        scoped: isScoped,
+        ignoreServerFields: scopeMode === "single",
       });
 
+      let score = bm25Norm + fuseNorm + Math.min(35, field.score);
+
+      // Full query in name
+      const normalizedQuery = normalizeForSearch(scoringQuery);
+      const nameText = normalizeForSearch(c.doc.name);
+      if (normalizedQuery && nameText.includes(normalizedQuery)) {
+        score += 15;
+        field.reasons.push("工具名包含完整查询 (+15)");
+      }
+
+      // Scoped boost
+      if (isScoped) {
+        score += 5;
+        field.reasons.push("已限定服务范围 (+5)");
+      }
+
+      // Determine matchKind
+      let matchKind: ToolSearchMatchKind;
+      if (c.sources.has("bm25") && c.sources.has("fuse")) {
+        matchKind = "hybrid";
+      } else if (c.sources.has("bm25")) {
+        matchKind = "bm25";
+      } else if (c.sources.has("fuse")) {
+        matchKind = "fuzzy";
+      } else {
+        matchKind = "token_fallback";
+      }
+
+      // Caps based on source
+      if (matchKind === "token_fallback") {
+        score = Math.min(score, isScoped ? 50 : 45);
+        field.reasons.push("token fallback 结果，封顶 (-cap)");
+      } else if (matchKind === "fuzzy" && !c.sources.has("bm25")) {
+        if (field.nameWeight === 0 && field.aliasWeight === 0) {
+          score = Math.min(score, 45);
+          field.reasons.push("Fuse-only 无强字段命中，封顶 (-cap)");
+        }
+      }
+
+      // Description-only cap
+      if (
+        field.nameWeight === 0 &&
+        field.aliasWeight === 0 &&
+        field.serverWeight === 0 &&
+        field.descWeight > 0
+      ) {
+        score -= 8;
+        score = Math.min(score, isScoped ? 55 : 50);
+        field.reasons.push("仅描述命中，降低置信度并限制最高分 (-8, cap)");
+      }
+
+      score = Math.max(0, Math.min(100, Math.round(score)));
+
       return {
-        server: doc.server,
-        tool: doc.name,
-        qualifiedName: doc.qualifiedName,
-        description: doc.description || "",
-        inputSchema: doc.inputSchema,
-        score: scored.score,
-        matchKind: "fuzzy" as const,
-        matchReasons: scored.reasons,
+        server: c.doc.server,
+        tool: c.doc.name,
+        qualifiedName: c.doc.qualifiedName,
+        description: c.doc.description || "",
+        inputSchema: c.doc.inputSchema,
+        score,
+        matchKind,
+        matchReasons: field.reasons,
       };
     });
 
-    const minScore = scoped ? 25 : 30;
+    const minScore = isScoped ? 25 : 30;
 
     const filtered = reranked
       .filter((r) => r.score >= minScore)
@@ -351,9 +409,143 @@ export class SearchIndex {
     if (filtered.length > 0) return filtered;
 
     return this.tokenMatchFallback(scoringQuery, candidates, limit, {
-      scoped,
-      ignoreServerFields: scoped,
+      scoped: isScoped,
+      ignoreServerFields: scopeMode === "single",
     });
+  }
+
+  /**
+   * 纯 IDF 加权字段命中分数，不含 Fuse/BM25 基础分。
+   * 用于 hybrid 统一 rerank。
+   */
+  private computeFieldHits(
+    doc: ToolSearchDoc,
+    query: string,
+    options?: { scoped?: boolean; ignoreServerFields?: boolean },
+  ): {
+    score: number;
+    reasons: string[];
+    nameWeight: number;
+    aliasWeight: number;
+    serverWeight: number;
+    qualifiedWeight: number;
+    descWeight: number;
+  } {
+    const reasons: string[] = [];
+    const queryTokens = tokenizeForSearch(query);
+
+    const nameText = normalizeForSearch(doc.name);
+    const qualifiedText = normalizeForSearch(doc.qualifiedName);
+    const descText = normalizeForSearch(doc.description || "");
+    const serverText = normalizeForSearch(doc.server);
+    const aliasText = normalizeForSearch(doc.serverAliases.join(" "));
+
+    // Pre-tokenize fields for exact/prefix match detection
+    const nameTokens = tokenizeForSearch(nameText);
+    const qualifiedTokens = tokenizeForSearch(qualifiedText);
+    const descTokens = tokenizeForSearch(descText);
+    const serverTokens = tokenizeForSearch(serverText);
+    const aliasTokens = tokenizeForSearch(aliasText);
+
+    let nameWeight = 0;
+    let qualifiedWeight = 0;
+    let descWeight = 0;
+    let serverWeight = 0;
+    let aliasWeight = 0;
+
+    for (const token of queryTokens) {
+      const w = this.idf(token);
+      nameWeight += w * tokenHitWeightForField(nameText, nameTokens, token);
+      descWeight += w * tokenHitWeightForField(descText, descTokens, token);
+
+      if (!options?.ignoreServerFields) {
+        qualifiedWeight +=
+          w * tokenHitWeightForField(qualifiedText, qualifiedTokens, token);
+        serverWeight +=
+          w * tokenHitWeightForField(serverText, serverTokens, token);
+        aliasWeight +=
+          w * tokenHitWeightForField(aliasText, aliasTokens, token);
+      }
+    }
+
+    let score = 0;
+
+    if (nameWeight > 0) {
+      const boost = Math.min(25, Math.round(nameWeight * 4));
+      score += boost;
+      reasons.push(`工具名命中 IDF 加权 (+${boost})`);
+    }
+
+    if (qualifiedWeight > 0) {
+      const boost = Math.min(10, Math.round(qualifiedWeight * 2));
+      score += boost;
+      reasons.push(`完整工具名命中 IDF 加权 (+${boost})`);
+    }
+
+    if (aliasWeight > 0) {
+      const boost = Math.min(15, Math.round(aliasWeight * 3));
+      score += boost;
+      reasons.push(`服务别名命中 IDF 加权 (+${boost})`);
+    }
+
+    if (serverWeight > 0) {
+      const boost = Math.min(8, Math.round(serverWeight * 2));
+      score += boost;
+      reasons.push(`服务名命中 IDF 加权 (+${boost})`);
+    }
+
+    if (descWeight > 0) {
+      const boost = Math.min(12, Math.round(descWeight * 2));
+      score += boost;
+      reasons.push(`描述命中 IDF 加权 (+${boost})`);
+    }
+
+    return {
+      score,
+      reasons,
+      nameWeight,
+      aliasWeight,
+      serverWeight,
+      qualifiedWeight,
+      descWeight,
+    };
+  }
+
+  /**
+   * Token fallback 原始结果（未过滤），用于 hybrid merge 时补充候选。
+   */
+  private tokenMatchFallbackRaw(
+    query: string,
+    candidates: ToolSearchDoc[],
+    options?: { scoped?: boolean; ignoreServerFields?: boolean },
+  ): Array<{ doc: ToolSearchDoc; score: number; reasons: string[] }> {
+    const scoped = options?.scoped === true;
+
+    return candidates
+      .map((doc) => {
+        const field = this.computeFieldHits(doc, query, options);
+        let score = scoped ? 35 + field.score : field.score;
+        const reasons = [...field.reasons];
+
+        if (
+          field.nameWeight === 0 &&
+          field.qualifiedWeight === 0 &&
+          field.serverWeight === 0 &&
+          field.aliasWeight === 0 &&
+          field.descWeight > 0
+        ) {
+          score -= 8;
+          score = Math.min(score, scoped ? 50 : 45);
+          reasons.push("仅描述命中，降低置信度并限制最高分 (-8, cap)");
+        }
+
+        return {
+          doc,
+          score: Math.max(0, Math.min(100, Math.round(score))),
+          reasons,
+        };
+      })
+      .filter((item) => item.score >= (scoped ? 35 : 45));
   }
 
   /**
@@ -379,61 +571,60 @@ export class SearchIndex {
       let score = scoped ? 35 : 0;
       const reasons: string[] = [];
 
-      let nameHits = 0;
-      let qualifiedHits = 0;
-      let descHits = 0;
-      let serverHits = 0;
-      let aliasHits = 0;
+      let nameWeight = 0;
+      let qualifiedWeight = 0;
+      let descWeight = 0;
+      let serverWeight = 0;
+      let aliasWeight = 0;
 
       for (const token of queryTokens) {
-        if (nameText.includes(token)) nameHits++;
-        if (descText.includes(token)) descHits++;
+        const w = this.idf(token);
+        if (nameText.includes(token)) nameWeight += w;
+        if (descText.includes(token)) descWeight += w;
 
         if (!options?.ignoreServerFields) {
-          if (qualifiedText.includes(token)) qualifiedHits++;
-          if (serverText.includes(token)) serverHits++;
-          if (aliasText.includes(token)) aliasHits++;
+          if (qualifiedText.includes(token)) qualifiedWeight += w;
+          if (serverText.includes(token)) serverWeight += w;
+          if (aliasText.includes(token)) aliasWeight += w;
         }
       }
 
-      if (nameHits > 0) {
-        const boost = Math.min(35, nameHits * 15);
+      if (nameWeight > 0) {
+        const boost = Math.min(35, Math.round(nameWeight * 5));
         score += boost;
-        reasons.push(`工具名命中 ${nameHits} 个查询 token (+${boost})`);
+        reasons.push(`工具名命中 IDF 加权 (+${boost})`);
       }
 
-      if (qualifiedHits > 0) {
-        const boost = Math.min(12, qualifiedHits * 4);
+      if (qualifiedWeight > 0) {
+        const boost = Math.min(12, Math.round(qualifiedWeight * 2));
         score += boost;
-        reasons.push(
-          `完整工具名命中 ${qualifiedHits} 个查询 token (+${boost})`,
-        );
+        reasons.push(`完整工具名命中 IDF 加权 (+${boost})`);
       }
 
-      if (aliasHits > 0) {
-        const boost = Math.min(18, aliasHits * 9);
+      if (aliasWeight > 0) {
+        const boost = Math.min(18, Math.round(aliasWeight * 4));
         score += boost;
-        reasons.push(`服务别名命中 ${aliasHits} 个查询 token (+${boost})`);
+        reasons.push(`服务别名命中 IDF 加权 (+${boost})`);
       }
 
-      if (serverHits > 0) {
-        const boost = Math.min(10, serverHits * 5);
+      if (serverWeight > 0) {
+        const boost = Math.min(10, Math.round(serverWeight * 2));
         score += boost;
-        reasons.push(`服务名命中 ${serverHits} 个查询 token (+${boost})`);
+        reasons.push(`服务名命中 IDF 加权 (+${boost})`);
       }
 
-      if (descHits > 0) {
-        const boost = Math.min(15, descHits * 5);
+      if (descWeight > 0) {
+        const boost = Math.min(15, Math.round(descWeight * 2));
         score += boost;
-        reasons.push(`描述命中 ${descHits} 个查询 token (+${boost})`);
+        reasons.push(`描述命中 IDF 加权 (+${boost})`);
       }
 
       const onlyDescriptionHit =
-        nameHits === 0 &&
-        qualifiedHits === 0 &&
-        serverHits === 0 &&
-        aliasHits === 0 &&
-        descHits > 0;
+        nameWeight === 0 &&
+        qualifiedWeight === 0 &&
+        serverWeight === 0 &&
+        aliasWeight === 0 &&
+        descWeight > 0;
 
       if (onlyDescriptionHit) {
         score -= 8;
@@ -442,7 +633,7 @@ export class SearchIndex {
       }
 
       const hasFunctionalHit =
-        nameHits > 0 || qualifiedHits > 0 || descHits > 0;
+        nameWeight > 0 || qualifiedWeight > 0 || descWeight > 0;
 
       return {
         doc,

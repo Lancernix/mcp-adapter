@@ -17,7 +17,7 @@
 - ⚡ **冷启动与惰性 JIT 唤醒 (Lazy Loading)：** 当 metadata cache 有效时，adapter 启动不会唤醒任何底层 MCP server。首次 cache 为空或部分失效时，adapter 会先接入客户端，再在后台顺序刷新缺失 metadata；每个 server 刷新完成后，若连接由 metadata refresh 临时创建则立即关闭；若该连接正在被其他请求复用则不会误关，后续交由 idle sweeper 自动释放。
 - ⏳ **闲置消退与自动降温 (Idle Autorelease)：** 内置 30s 扫描周期的 Sweeper。当底层服务闲置超过指定阈值（默认全局 10 分钟，支持单服务自定义）时，平滑杀死底层子进程并断开连接，彻底释放物理内存。
 - 💀 **死亡守卫 (Parent Death Watch)：** 拦截父进程的 `stdin` 的 `close` 事件与常规终止信号（`SIGINT`/`SIGTERM`），当父进程退出或管道破裂时，立即进入清理流程，尽力关闭所有底层连接与子进程，避免僵尸进程残留。
-- 🔍 **通用工具搜索 (Fuse.js Token Search)：** 搜索层启用 Fuse.js Token Search，并结合 `Intl.Segmenter` 与中文 bigram 兜底处理多词和中文连续文本。adapter 不内置业务同义词表，而是根据工具名、服务别名、描述等字段的命中位置进行分层加权排序，并通过 `matchReasons` 输出匹配依据，帮助模型判断是否可直接执行或需要继续 `list_tools` / `describe_tool`。
+- 🔍 **混合工具搜索（BM25 + Fuse.js Token Search + IDF Rerank）：** 搜索层结合轻量 BM25 关键词召回、Fuse.js Token Search 多词模糊匹配，以及 IDF 加权字段命中重排。支持中英混合、中文服务别名、typo、多词乱序搜索。自动降低 `get`/`list`/`search`/`query` 等泛词影响，优先提升工具名、服务别名、稀有关键词的权重。Fuse Token Search 支持 `tokenMatch: "any"` 以保留部分 token 命中的召回能力，中文搜索通过 `Intl.Segmenter` 与 bigram 兜底增强。搜索结果通过 `matchReasons` 输出匹配依据和置信度，帮助模型判断是否可直接执行或需要先 `describe_tool`。
 - 📦 **一键无损迁移 (CLI Config Migration)：** 提供一键 CLI 导入工具，可无损迁移现有的 MCP 声明（如 `~/.claude.json`），根据服务名自动生成基础 aliases，保留源配置中已有 aliases。
 
 ---
@@ -74,7 +74,7 @@
 * **设计细节：** 返回候选工具的描述与完整 `inputSchema`，通常可直接据此调用 `execute_tool`。当 query 命中某个 server 但功能关键词未强匹配时，会返回该 server 下的候选工具作为兜底。为避免极端复杂工具 Schema 造成单次响应过大，`search_tools` 会对超长 `inputSchema` 做安全截断；如需完整 Schema，请使用 `describe_tool` 查询单个工具。
 * **参数：**
   * `query` (string, 必填): 想要实现的诉求或功能关键字（如 `"siyuan sql"`, `"钉钉文档"`, `"search"`）。
-  * `server` (string, 可选): 指定仅在特定服务名或别名下窄化检索。
+  * `server` (string, 可选): 目标服务提示（hint）。可填写真实 server key、中文名、英文名、aliases 或近似名称。高置信匹配时会在对应服务下窄化检索；存在歧义或低置信时会回退全局搜索，并将该提示作为搜索关键词参与排序。
   * `limit` (number, 可选): 返回条数，默认 10，最大 20。
 
 ### 2. `list_tools`
@@ -102,7 +102,34 @@
 
 ## 安装与配置
 
-### 1. 克隆并构建
+### npm 全局安装（推荐）
+
+```bash
+npm install -g @lancernix/mcp-adapter
+```
+
+安装后直接运行：
+
+```bash
+mcp-adapter
+```
+
+### npx 直接使用（无需安装）
+
+在 MCP 客户端配置中直接使用 npx，无需提前安装：
+
+```json
+{
+  "mcpServers": {
+    "mcp-adapter": {
+      "command": "npx",
+      "args": ["-y", "@lancernix/mcp-adapter"]
+    }
+  }
+}
+```
+
+### 源码克隆并构建
 
 ```bash
 git clone <repo-url> mcp-adapter
@@ -122,14 +149,30 @@ npm link
 
 若你此前已在 `~/.claude.json` 中配置了大量的 MCP Server，可以使用内置迁移工具一键导入：
 
+**npx 直接使用（推荐，无需安装）：**
+
 ```bash
 # 预览导入内容，不写入（推荐先执行此步骤确认无误）
-node dist/index.js import --from ~/.claude.json --dry-run
+npx -y @lancernix/mcp-adapter import --dry-run
 
 # 确认无误后正式导入
-node dist/index.js import --from ~/.claude.json
+npx -y @lancernix/mcp-adapter import
+```
 
-# 迁移成功后，配置将被合流并原子写入 ~/.mcp-adapter/config.json 中
+`--from` 参数可选。默认从 `~/.claude.json` 读取，如果你的配置文件在其他路径，可通过 `--from <path>` 指定。
+
+**npm 全局安装后：**
+
+```bash
+mcp-adapter import --dry-run
+mcp-adapter import
+```
+
+**源码构建后：**
+
+```bash
+node dist/index.js import --dry-run
+node dist/index.js import
 ```
 
 ---
@@ -202,12 +245,71 @@ node dist/index.js import --from ~/.claude.json
 * `refreshOnStartup` (boolean, 可选): 设为 `true` 时，该 server 会在 adapter 每次启动后的后台 bootstrap 中强制刷新 metadata cache，跳过缓存有效性检查。推荐用于 HTTP/SSE 等在线服务或工具列表可能动态变化的服务。对 stdio 服务也生效，但会在每次启动后后台拉起对应子进程，请谨慎开启。
 * `connectTimeoutMs` / `requestTimeoutMs` / `closeTimeoutMs` (number, 可选): 覆盖全局对应超时设置，单位为毫秒。适用于个别响应较慢的服务（如报表生成类工具）。
 
+### aliases 最佳实践
+
+`aliases` 直接影响 `search_tools` 的服务识别、query 中服务名检测和搜索结果排序加权。**如果你的服务使用了中文名或其他常用别称，强烈建议配置 aliases。**
+
+`search_tools` 的 `server` 参数是**服务提示（hint）**，不要求精确的 server key。你可以填入自然语言服务名、中文名、别名或近似名称（如 `"钉钉文档"`、`"dingtalk"`、`"dingtalk doc"`），网关会自动尝试匹配。如果无法高置信匹配，会自动回退全局搜索而不是报错。
+
+推荐配置如下：
+
+```json
+{
+  "mcpServers": {
+    "dingtalk-doc": {
+      "aliases": ["钉钉", "钉钉文档", "dingtalk", "dingtalk doc", "dingding"]
+    },
+    "siyuan-mcp": {
+      "aliases": ["思源", "思源笔记", "siyuan", "siyuan note"]
+    },
+    "feishu-bitable": {
+      "aliases": ["飞书", "飞书多维表格", "多维表格", "bitable", "feishu", "lark"]
+    },
+    "github": {
+      "aliases": ["GitHub", "github.com", "gh"]
+    }
+  }
+}
+```
+
+规则：
+- 中文服务名**必须**配置 aliases，网关不会自动生成中文变体
+- 英文 server key 中的分隔符（`-`、`_`、`.`）会被自动归一化为空格，无需单独配置 `dingtalkdoc` 之类变体
+- `search_tools` 会优先匹配 aliases 精确命中项并加权排序
+- 如果你不确定 aliases 是否足够，可以在实际使用 `search_tools` 时观察匹配结果中的 `matchReasons` 来调整
+
 ---
 
 ## 客户端接入示例
 
 ### 在 Claude Code 中接入
-通过 `HOME=/home/ubuntu` 运行 Claude CLI，或者在 Claude CLI 配置中添加本服务。以全局 `mcp-adapter` 为例：
+
+**npm 全局安装后：**
+
+```json
+{
+  "mcpServers": {
+    "mcp-adapter": {
+      "command": "mcp-adapter"
+    }
+  }
+}
+```
+
+**npx 直接使用：**
+
+```json
+{
+  "mcpServers": {
+    "mcp-adapter": {
+      "command": "npx",
+      "args": ["-y", "@lancernix/mcp-adapter"]
+    }
+  }
+}
+```
+
+**源码构建后：**
 
 ```json
 {

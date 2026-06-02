@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 // index.ts - Standard MCP Server Entrypoint for @lancernix/mcp-adapter
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import {
   getValidCachedServers,
@@ -13,6 +16,7 @@ import {
   getConfigPath,
   getMcpAdapterHome,
   loadConfig,
+  resolveServerHint,
   resolveServerName,
   saveConfig,
 } from "./config-manager.js";
@@ -37,7 +41,12 @@ import type {
 
 const SearchToolsArgsSchema = z.object({
   query: z.string().min(1, "query 不能为空"),
-  server: z.string().optional(),
+  server: z
+    .string()
+    .optional()
+    .describe(
+      "可选目标服务提示（hint）。可填写用户提到的服务名、中文名、别名或近似名称，例如：钉钉文档、dingtalk、siyuan。不要求精确 server key。若无法高置信匹配，会自动回退全局搜索。",
+    ),
   limit: z.coerce.number().int().min(1).max(20).optional(),
 });
 
@@ -373,6 +382,29 @@ function stringifySchemaForSearch(schema: JsonSchema | undefined): string {
   return `${text.slice(0, MAX_SCHEMA_CHARS)}\n... schema 已截断，请使用 describe_tool 查看完整 inputSchema`;
 }
 
+function buildExecutionAdvice(match: ToolSearchResult): string {
+  if (match.matchKind === "server_browse") {
+    return "这是服务浏览兜底结果，请先调用 describe_tool 确认具体功能后再执行。";
+  }
+
+  if (match.matchKind === "token_fallback" && match.score < 50) {
+    return "关键词兜底结果，建议先调用 describe_tool 确认参数定义。";
+  }
+
+  if (
+    (match.matchKind === "hybrid" || match.matchKind === "bm25") &&
+    match.score >= 70
+  ) {
+    return "高置信匹配，参数明确时可直接 execute_tool。";
+  }
+
+  if (match.matchKind === "fuzzy" && match.score >= 65) {
+    return "较高置信匹配，执行前请确认 inputSchema。";
+  }
+
+  return "中低置信匹配，建议先调用 describe_tool 确认后再执行。";
+}
+
 function buildSearchTitle(
   matches: ToolSearchResult[],
   targetServer?: string,
@@ -426,43 +458,65 @@ mcpServer.registerTool(
     description:
       "检索所有配置的 MCP 工具。推荐优先使用此工具。模糊匹配工具名、服务名、别名和描述正文。" +
       "搜索结果已包含完整 inputSchema，足以直接调用 execute_tool，无需再调 describe_tool。" +
-      "搜索策略：工具量大时先按服务名搜（如 'dingtalk'）再按功能定位；" +
+      "query 应保留用户请求中的关键名词、动作和目标系统名（如 'postgres schema'、'钉钉文档 搜索'），不要只填 get/list/search/query 等泛词。" +
+      "server 是可选的服务提示（hint），可填写自然语言服务名、中文名或别名，不要求是精确的 server key；无法高置信匹配时将自动回退全局搜索。" +
+      "低置信结果建议先调 describe_tool 确认参数定义后再执行。" +
       "已知工具名需看完整参数定义时使用 describe_tool。",
     inputSchema: SearchToolsArgsSchema,
   },
   async ({ query, server: targetServerInput, limit }) => {
     let targetServer: string | undefined;
+    let serverHintNote: string | undefined;
+    let effectiveQuery = query;
+    let lowCandidateRefreshFailed: string | undefined;
 
     if (targetServerInput) {
-      const resolved = resolveServerName(targetServerInput, config.mcpServers);
-      if (!resolved) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `[mcp-adapter-ERROR] 未找到 server "${targetServerInput}"。请检查服务名或 aliases，或先查看 config.json 中的 mcpServers。`,
-            },
-          ],
-        };
-      }
+      const resolved = resolveServerHint(targetServerInput, config.mcpServers);
+      if (resolved.confidence === "high" && resolved.resolvedServer) {
+        if (isServerDisabled(resolved.resolvedServer)) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: disabledServerText(resolved.resolvedServer),
+              },
+            ],
+          };
+        }
 
-      if (isServerDisabled(resolved)) {
-        return {
-          content: [{ type: "text", text: disabledServerText(resolved) }],
-        };
-      }
+        targetServer = resolved.resolvedServer;
+        const ok = await ensureServerMetadata(targetServer);
+        if (!ok) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `[mcp-adapter-ERROR] 已识别 server "${targetServer}"，但刷新 metadata 失败。请检查该 MCP 服务是否可启动、网络是否可达、认证信息是否正确。`,
+              },
+            ],
+          };
+        }
+        serverHintNote = `服务提示 "${targetServerInput}" 已解析为 server "${targetServer}"，已在该服务范围内搜索。`;
+      } else {
+        // 中低置信或无法匹配时，将 hint 拼回 query 作为搜索关键词
+        effectiveQuery = `${targetServerInput} ${query}`;
 
-      targetServer = resolved;
-      const ok = await ensureServerMetadata(targetServer);
-      if (!ok) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `[mcp-adapter-ERROR] 已识别 server "${targetServer}"，但刷新 metadata 失败。请检查该 MCP 服务是否可启动、网络是否可达、认证信息是否正确。`,
-            },
-          ],
-        };
+        // low 置信且唯一 candidate：刷新其 metadata 但不 scoped
+        if (resolved.confidence === "low" && resolved.candidates.length === 1) {
+          const candidate = resolved.candidates[0];
+          const ok = await ensureServerMetadata(candidate);
+          if (!ok) {
+            lowCandidateRefreshFailed = `低置信候选 server "${candidate}" metadata 刷新失败，搜索可能不完整。`;
+          }
+        }
+
+        if (resolved.confidence === "medium") {
+          serverHintNote = `服务提示 "${targetServerInput}" 存在歧义（${resolved.reason}），已将其作为搜索关键词参与全局搜索。`;
+        } else if (resolved.confidence === "low") {
+          serverHintNote = `服务提示 "${targetServerInput}" 未能高置信匹配（${resolved.reason}），已将其作为搜索关键词参与全局搜索。`;
+        } else {
+          serverHintNote = `服务提示 "${targetServerInput}" 未匹配到已配置服务，已将其作为搜索关键词参与全局搜索。`;
+        }
       }
     }
 
@@ -485,7 +539,11 @@ mcpServer.registerTool(
       limit ?? config.settings?.toolSearchLimit ?? 10,
       20,
     );
-    const matches = searchIndex.search(query, targetServer, effectiveLimit);
+    const matches = searchIndex.search(
+      effectiveQuery,
+      targetServer,
+      effectiveLimit,
+    );
 
     if (matches.length === 0 && targetServer) {
       // 已识别 server 但功能关键词无强匹配 → fallback 到 server 工具候选
@@ -529,7 +587,14 @@ mcpServer.registerTool(
     }
 
     if (matches.length === 0) {
-      let text = `[mcp-adapter] 暂未匹配到与 "${query}" 相关的接口。`;
+      let text = serverHintNote ? `${serverHintNote}\n\n` : "";
+      text += `[mcp-adapter] 暂未匹配到与 query="${query}" 相关的接口。`;
+      if (targetServerInput) {
+        text += `\n服务提示: "${targetServerInput}"。`;
+      }
+      if (effectiveQuery !== query) {
+        text += `\n实际搜索组合查询: "${effectiveQuery}"。`;
+      }
 
       if (bootstrapStatus.running) {
         text += `\n\n当前工具索引正在后台初始化：${bootstrapStatus.completed}/${bootstrapStatus.total} 已完成`;
@@ -540,8 +605,15 @@ mcpServer.registerTool(
       } else {
         const validCache = getValidCachedServers(config, loadMetadataCache());
         if (Object.keys(validCache).length === 0) {
-          text +=
-            "\n\n当前 metadata cache 为空。adapter 会在后台初始化，请稍后重试。";
+          const bootstrapMode =
+            config.settings?.metadataBootstrap ?? "background";
+          if (bootstrapMode === "off") {
+            text +=
+              "\n\n当前 metadata cache 为空，且 metadataBootstrap=off。请使用带 server 参数的 search_tools、list_tools 或 describe_tool 手动触发对应服务的 metadata 刷新。";
+          } else {
+            text +=
+              "\n\n当前 metadata cache 为空。adapter 会在后台初始化，请稍后重试。";
+          }
         } else {
           const availableServers = Object.entries(config.mcpServers)
             .filter(([, cfg]) => !cfg.disabled)
@@ -562,6 +634,10 @@ mcpServer.registerTool(
         text += `\n\n已根据 query 识别到 server "${inferredServer}"，但 metadata 刷新失败。请检查该服务是否可启动、网络/认证是否正常，或显式传入 server 参数重试。`;
       }
 
+      if (lowCandidateRefreshFailed) {
+        text += `\n\n${lowCandidateRefreshFailed}`;
+      }
+
       return {
         content: [{ type: "text", text }],
       };
@@ -575,17 +651,28 @@ mcpServer.registerTool(
       grouped.set(m.server, list);
     }
 
-    let replyText = buildSearchTitle(matches, targetServer);
+    let replyText = serverHintNote ? `${serverHintNote}\n\n` : "";
+    replyText += buildSearchTitle(matches, targetServer);
     for (const [srv, tools] of grouped) {
       replyText += `### ${srv} (${tools.length} matches)\n`;
       for (const match of tools) {
         replyText += `- **${match.qualifiedName}** (${match.score}分`;
-        if (match.matchKind !== "fuzzy") {
+        if (
+          match.matchKind !== "fuzzy" &&
+          match.matchKind !== "hybrid" &&
+          match.matchKind !== "bm25"
+        ) {
           const kindLabel =
             match.matchKind === "token_fallback"
               ? "关键词兜底"
               : "服务浏览兜底";
           replyText += `, ${kindLabel}`;
+        }
+        if (match.matchKind === "hybrid") {
+          replyText += ", 混合匹配";
+        }
+        if (match.matchKind === "bm25") {
+          replyText += ", BM25匹配";
         }
         replyText += ")\n";
         replyText += `  描述: ${match.description || "无"}\n`;
@@ -593,6 +680,8 @@ mcpServer.registerTool(
         if (match.matchReasons?.length) {
           replyText += `  匹配依据: ${match.matchReasons.join("；")}\n`;
         }
+
+        replyText += `  执行建议: ${buildExecutionAdvice(match)}\n`;
 
         replyText += "  inputSchema:\n";
         replyText += "```json\n";
@@ -619,9 +708,12 @@ mcpServer.registerTool(
     inputSchema: DescribeToolArgsSchema,
   },
   async ({ tool: toolInput, server: serverInput }) => {
+    // 从输入中提前解析目标 server 并刷新 metadata
+    let resolvedServer: string | null = null;
+
     if (serverInput) {
-      const resolved = resolveServerName(serverInput, config.mcpServers);
-      if (!resolved) {
+      resolvedServer = resolveServerName(serverInput, config.mcpServers);
+      if (!resolvedServer) {
         return {
           content: [
             {
@@ -631,71 +723,36 @@ mcpServer.registerTool(
           ],
         };
       }
+    } else if (toolInput.includes(".")) {
+      const parsed = parseQualifiedToolInput(toolInput);
+      if (parsed) {
+        resolvedServer = parsed.server;
+      } else {
+        const idx = toolInput.indexOf(".");
+        resolvedServer = resolveServerName(
+          toolInput.substring(0, idx),
+          config.mcpServers,
+        );
+      }
+    }
 
-      if (isServerDisabled(resolved)) {
+    if (resolvedServer) {
+      if (isServerDisabled(resolvedServer)) {
         return {
-          content: [{ type: "text", text: disabledServerText(resolved) }],
+          content: [{ type: "text", text: disabledServerText(resolvedServer) }],
         };
       }
 
-      const ok = await ensureServerMetadata(resolved);
+      const ok = await ensureServerMetadata(resolvedServer);
       if (!ok) {
         return {
           content: [
             {
               type: "text",
-              text: `[mcp-adapter-ERROR] 已找到 server "${resolved}"，但 metadata 不可用。请检查该 MCP 服务是否可启动、网络是否可达。`,
+              text: `[mcp-adapter-ERROR] 已找到 server "${resolvedServer}"，但 metadata 不可用。请检查该 MCP 服务是否可启动、网络是否可达。`,
             },
           ],
         };
-      }
-    } else if (toolInput.includes(".")) {
-      const parsed = parseQualifiedToolInput(toolInput);
-
-      if (parsed) {
-        if (isServerDisabled(parsed.server)) {
-          return {
-            content: [
-              { type: "text", text: disabledServerText(parsed.server) },
-            ],
-          };
-        }
-
-        const ok = await ensureServerMetadata(parsed.server);
-        if (!ok) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `[mcp-adapter-ERROR] 已找到 server "${parsed.server}"，但 metadata 不可用。请检查该 MCP 服务是否可启动、网络是否可达。`,
-              },
-            ],
-          };
-        }
-      }
-
-      // fallback: 首个 "." 分割
-      const idx = toolInput.indexOf(".");
-      const serverPart = toolInput.substring(0, idx);
-      const resolved = resolveServerName(serverPart, config.mcpServers);
-      if (resolved && !parsed) {
-        if (isServerDisabled(resolved)) {
-          return {
-            content: [{ type: "text", text: disabledServerText(resolved) }],
-          };
-        }
-
-        const ok = await ensureServerMetadata(resolved);
-        if (!ok) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `[mcp-adapter-ERROR] 已找到 server "${resolved}"，但 metadata 不可用。请检查该 MCP 服务是否可启动、网络是否可达。`,
-              },
-            ],
-          };
-        }
       }
     }
 
@@ -893,8 +950,7 @@ mcpServer.registerTool(
         requestTimeoutMs,
         `执行工具 [${serverName}.${originalName}] 超时，超过 ${requestTimeoutMs}ms`,
       );
-      // biome-ignore lint/suspicious/noExplicitAny: MCP SDK 类型兼容
-      return rawResult as any;
+      return rawResult as CallToolResult;
     } catch (err) {
       if (err instanceof TimeoutError) {
         shouldDropConnection = true;
@@ -945,17 +1001,21 @@ function parseQualifiedToolInput(
 ): { server: string; tool: string } | null {
   const text = input.trim();
   const lowerText = text.toLowerCase();
-  const candidates = Object.keys(config.mcpServers).sort(
-    (a, b) => b.length - a.length,
-  );
 
-  for (const serverName of candidates) {
-    const prefix = `${serverName}.`;
+  // 收集所有候选前缀：server key + aliases
+  const candidates: Array<{ name: string; server: string }> = [];
+  for (const [serverName, cfg] of Object.entries(config.mcpServers)) {
+    candidates.push({ name: serverName, server: serverName });
+    for (const alias of cfg.aliases || []) {
+      candidates.push({ name: alias, server: serverName });
+    }
+  }
+  candidates.sort((a, b) => b.name.length - a.name.length);
+
+  for (const { name, server } of candidates) {
+    const prefix = `${name}.`;
     if (lowerText.startsWith(prefix.toLowerCase())) {
-      return {
-        server: serverName,
-        tool: text.slice(prefix.length),
-      };
+      return { server, tool: text.slice(prefix.length) };
     }
   }
 
@@ -967,12 +1027,17 @@ function stripQualifiedPrefixForServer(
   serverName: string,
 ): string {
   const text = toolInput.trim();
-  const prefix = `${serverName}.`;
+  const cfg = config.mcpServers[serverName];
+  const prefixes = [serverName, ...(cfg?.aliases || [])]
+    .map((x) => `${x}.`)
+    .sort((a, b) => b.length - a.length);
 
-  if (text.toLowerCase().startsWith(prefix.toLowerCase())) {
-    return text.slice(prefix.length);
+  const lower = text.toLowerCase();
+  for (const prefix of prefixes) {
+    if (lower.startsWith(prefix.toLowerCase())) {
+      return text.slice(prefix.length);
+    }
   }
-
   return text;
 }
 
@@ -1210,12 +1275,28 @@ async function main() {
 
   if (args[0] === "import") {
     const fromIdx = args.indexOf("--from");
-    const fromPath = fromIdx !== -1 ? args[fromIdx + 1] : undefined;
+    let fromPath = fromIdx !== -1 ? args[fromIdx + 1] : undefined;
     const dryRun = args.includes("--dry-run");
 
     if (!fromPath) {
+      const home = os.homedir();
+      // 尝试常见的默认路径
+      const candidates = [
+        path.join(home, ".claude", "settings.json"),
+        path.join(home, ".claude.json"),
+      ];
+      for (const candidate of candidates) {
+        if (fs.existsSync(candidate)) {
+          fromPath = candidate;
+          break;
+        }
+      }
+    }
+
+    if (!fromPath || !fs.existsSync(fromPath)) {
       writeLog(
-        "[Error] 未指定源配置文件。用法: mcp-adapter import --from ~/.claude.json [--dry-run]\n",
+        "[Error] 未找到源配置文件。用法: mcp-adapter import [--from <path>] [--dry-run]\n" +
+          "默认从 ~/.claude.json 读取，也可通过 --from 指定其他路径。\n",
       );
       process.exit(1);
     }
