@@ -6,14 +6,25 @@
   "bin": {
     "mcp-adapter": "dist/index.js"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Lancernix/mcp-adapter.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Lancernix/mcp-adapter/issues"
+  },
+  "homepage": "https://github.com/Lancernix/mcp-adapter#readme",
   "engines": {
     "node": ">=20.0.0"
   },
   "scripts": {
-    "build": "tsc",
-    "watch": "tsc -w",
+    "build": "tsc -p tsconfig.build.json",
+    "watch": "tsc -w -p tsconfig.build.json",
     "start": "node dist/index.js",
-    "prepack": "npm run build"
+    "test": "tsx --test __tests__/search-index.test.ts",
+    "format": "biome format --write .",
+    "check": "biome check .",
+    "prepack": "pnpm run build"
   },
   "files": [
     "dist",
@@ -33,12 +44,13 @@
   ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "fuse.js": "^7.3.0",
+    "fuse.js": "^7.4.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.15",
     "@types/node": "^20.11.0",
+    "tsx": "^4.22.4",
     "typescript": "^5.9.3"
   },
   "volta": {

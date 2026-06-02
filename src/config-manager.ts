@@ -4,7 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
 import { AdapterConfigSchema } from "./config-schema.js";
-import type { AdapterConfig, ServerConfig } from "./types.js";
+import { normalizeForSearch } from "./search-utils.js";
+import type {
+  AdapterConfig,
+  ServerConfig,
+  ServerResolveResult,
+} from "./types.js";
 
 export function getMcpAdapterHome(): string {
   if (process.env.MCP_ADAPTER_HOME) {
@@ -132,16 +137,6 @@ export function saveConfig(config: AdapterConfig): void {
 }
 
 /**
- * 统一做小写与归一化处理，防止中英文符号和空格大小写差异
- */
-export function normalize(str: string): string {
-  return str
-    .trim()
-    .toLowerCase()
-    .replace(/[-_./:\s]+/g, " "); // 归一化分隔符为单个空格
-}
-
-/**
  * 构建子进程环境变量，过滤 process.env 中的 undefined 值
  */
 export function buildChildEnv(
@@ -184,16 +179,16 @@ export function resolveServerName(
   input: string,
   servers: Record<string, ServerConfig>,
 ): string | null {
-  const q = normalize(input);
+  const q = normalizeForSearch(input);
 
   for (const [serverName, config] of Object.entries(servers)) {
-    if (normalize(serverName) === q) {
+    if (normalizeForSearch(serverName) === q) {
       return serverName;
     }
 
     if (config.aliases) {
       for (const alias of config.aliases) {
-        if (normalize(alias) === q) {
+        if (normalizeForSearch(alias) === q) {
           return serverName;
         }
       }
@@ -201,4 +196,151 @@ export function resolveServerName(
   }
 
   return null;
+}
+
+/**
+ * 从 server key 自动生成变体（分隔符归一化为空格后的形式）
+ * 例如: "dingtalk-doc" → ["dingtalk doc"]
+ */
+function generateServerNameVariants(name: string): string[] {
+  const n = normalizeForSearch(name);
+  const original = name.trim().toLowerCase();
+  if (n !== original && n !== original.replace(/\s+/g, " ")) {
+    return [n];
+  }
+  return [];
+}
+
+/**
+ * 带置信度的 server hint 解析。用于 search_tools 的 server 参数。
+ * 与 resolveServerName 不同的是，它支持变体匹配、歧义检测和部分匹配，
+ * 并返回置信度分级结果。
+ */
+export function resolveServerHint(
+  input: string,
+  servers: Record<string, ServerConfig>,
+): ServerResolveResult {
+  const result: ServerResolveResult = {
+    original: input,
+    resolvedServer: null,
+    confidence: "none",
+    candidates: [],
+    reason: "",
+  };
+
+  const q = normalizeForSearch(input);
+  if (!q) {
+    result.reason = "输入为空";
+    return result;
+  }
+
+  // 1. Exact canonical server key 匹配
+  for (const [serverName] of Object.entries(servers)) {
+    if (normalizeForSearch(serverName) === q) {
+      result.resolvedServer = serverName;
+      result.confidence = "high";
+      result.candidates = [serverName];
+      result.reason = `精确匹配 server key "${serverName}"`;
+      return result;
+    }
+  }
+
+  // 2. Exact alias 匹配
+  const aliasMatches: string[] = [];
+  for (const [serverName, cfg] of Object.entries(servers)) {
+    if (cfg.aliases) {
+      for (const alias of cfg.aliases) {
+        if (normalizeForSearch(alias) === q) {
+          if (!aliasMatches.includes(serverName)) {
+            aliasMatches.push(serverName);
+          }
+        }
+      }
+    }
+  }
+
+  if (aliasMatches.length === 1) {
+    result.resolvedServer = aliasMatches[0];
+    result.confidence = "high";
+    result.candidates = aliasMatches;
+    result.reason = `精确匹配别名，指向 server "${aliasMatches[0]}"`;
+    return result;
+  }
+
+  if (aliasMatches.length > 1) {
+    result.confidence = "medium";
+    result.candidates = aliasMatches;
+    result.reason = `别名 "${input}" 匹配到 ${aliasMatches.length} 个 server，存在歧义: ${aliasMatches.join(", ")}`;
+    return result;
+  }
+
+  // 3. Variant 匹配（分隔符归一化后的等价形式）
+  const variantMatches: string[] = [];
+  for (const [serverName, cfg] of Object.entries(servers)) {
+    for (const variant of generateServerNameVariants(serverName)) {
+      if (variant === q) {
+        variantMatches.push(serverName);
+        break;
+      }
+    }
+    if (cfg.aliases) {
+      for (const alias of cfg.aliases) {
+        for (const variant of generateServerNameVariants(alias)) {
+          if (variant === q) {
+            if (!variantMatches.includes(serverName)) {
+              variantMatches.push(serverName);
+            }
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  if (variantMatches.length === 1) {
+    result.resolvedServer = variantMatches[0];
+    result.confidence = "medium";
+    result.candidates = variantMatches;
+    result.reason = `变体匹配，指向 server "${variantMatches[0]}"`;
+    return result;
+  }
+
+  if (variantMatches.length > 1) {
+    result.confidence = "medium";
+    result.candidates = variantMatches;
+    result.reason = `变体匹配到 ${variantMatches.length} 个 server，存在歧义: ${variantMatches.join(", ")}`;
+    return result;
+  }
+
+  // 4. 部分匹配（低置信）：input 是服务名或别名的子串
+  if (q.length >= 3) {
+    const partialMatches: string[] = [];
+    for (const [serverName, cfg] of Object.entries(servers)) {
+      const names = [serverName, ...(cfg.aliases || [])];
+      for (const name of names) {
+        if (normalizeForSearch(name).includes(q)) {
+          partialMatches.push(serverName);
+          break;
+        }
+      }
+    }
+
+    if (partialMatches.length === 1) {
+      result.resolvedServer = partialMatches[0];
+      result.confidence = "low";
+      result.candidates = partialMatches;
+      result.reason = `部分匹配，指向 server "${partialMatches[0]}"`;
+      return result;
+    }
+
+    if (partialMatches.length > 1) {
+      result.confidence = "low";
+      result.candidates = partialMatches;
+      result.reason = `部分匹配到 ${partialMatches.length} 个 server: ${partialMatches.join(", ")}`;
+      return result;
+    }
+  }
+
+  result.reason = `未找到匹配 "${input}" 的服务`;
+  return result;
 }

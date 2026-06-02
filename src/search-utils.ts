@@ -9,8 +9,7 @@ export function normalizeForSearch(text: string): string {
   return text
     .trim()
     .toLowerCase()
-    .replace(/[-_./:]+/g, " ")
-    .replace(/\s+/g, " ");
+    .replace(/[-_./:\s]+/g, " ");
 }
 
 function isWeakSearchToken(token: string): boolean {
@@ -20,14 +19,17 @@ function isWeakSearchToken(token: string): boolean {
   return false;
 }
 
-export function tokenizeForSearch(text: string): string[] {
+export function tokenizeForSearch(
+  text: string,
+  options: { unique?: boolean } = { unique: true },
+): string[] {
   const normalized = normalizeForSearch(text);
-  const tokens = new Set<string>();
+  const tokens: string[] = [];
 
   // 1. 英文、数字 token
   for (const m of normalized.matchAll(/[a-z0-9]+/gi)) {
     const t = m[0].toLowerCase();
-    if (!isWeakSearchToken(t)) tokens.add(t);
+    if (!isWeakSearchToken(t)) tokens.push(t);
   }
 
   // 2. Intl.Segmenter 中文分词
@@ -35,7 +37,7 @@ export function tokenizeForSearch(text: string): string[] {
     for (const seg of zhSegmenter.segment(normalized)) {
       if (seg.isWordLike) {
         const t = seg.segment.trim().toLowerCase();
-        if (t && !isWeakSearchToken(t)) tokens.add(t);
+        if (t && !isWeakSearchToken(t)) tokens.push(t);
       }
     }
   }
@@ -43,13 +45,16 @@ export function tokenizeForSearch(text: string): string[] {
   // 3. 连续中文串 bigram 兜底
   for (const m of normalized.matchAll(/[一-鿿]+/g)) {
     const s = m[0];
-    if (s.length >= 2) tokens.add(s);
+    if (s.length >= 2) tokens.push(s);
     for (let i = 0; i < s.length - 1; i++) {
-      tokens.add(s.slice(i, i + 2));
+      tokens.push(s.slice(i, i + 2));
     }
   }
 
-  return Array.from(tokens);
+  if (options.unique !== false) {
+    return Array.from(new Set(tokens));
+  }
+  return tokens;
 }
 
 function escapeRegExp(text: string): string {
