@@ -111,7 +111,7 @@
   "mcpServers": {
     "mcp-adapter": {
       "command": "npx",
-      "args": ["-y", "@lancernix/mcp-adapter"]
+      "args": ["-y", "@lancernix/mcp-adapter@latest"]
     }
   }
 }
@@ -155,10 +155,10 @@ npm link
 
 ```bash
 # 预览导入内容，不写入（推荐先执行此步骤确认无误）
-npx -y @lancernix/mcp-adapter import --dry-run
+npx -y @lancernix/mcp-adapter@latest import --dry-run
 
 # 确认无误后正式导入
-npx -y @lancernix/mcp-adapter import
+npx -y @lancernix/mcp-adapter@latest import
 ```
 
 `--from` 参数可选。默认从 `~/.claude.json` 读取，如果你的配置文件在其他路径，可通过 `--from <path>` 指定。
@@ -293,7 +293,7 @@ node dist/index.js import
   "mcpServers": {
     "mcp-adapter": {
       "command": "npx",
-      "args": ["-y", "@lancernix/mcp-adapter"]
+      "args": ["-y", "@lancernix/mcp-adapter@latest"]
     }
   }
 }
