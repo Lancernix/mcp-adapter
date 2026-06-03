@@ -1190,6 +1190,10 @@ function locateTool(
 
 // ---- CLI import ----
 
+function isLikelyMcpAdapterSelf(_name: string, config: any): boolean {
+  return JSON.stringify(config).includes("mcp-adapter");
+}
+
 function importConfig(fromPath: string, dryRun = false) {
   if (!fromPath || !fs.existsSync(fromPath)) {
     writeLog(`[Error] 找不到源配置文件: ${fromPath}\n`);
@@ -1215,6 +1219,12 @@ function importConfig(fromPath: string, dryRun = false) {
 
     for (const [name, serverConfig] of Object.entries(sourceServers)) {
       if (!serverConfig || typeof serverConfig !== "object") continue;
+
+      // 跳过 mcp-adapter 自身配置，防止循环启动
+      if (isLikelyMcpAdapterSelf(name, serverConfig)) {
+        preview.push(`  ⚠️  ${name} [跳过：疑似 mcp-adapter 自身配置，如需导入请手动添加到 config.json]`);
+        continue;
+      }
 
       const parsedServer = ServerConfigSchema.safeParse(serverConfig);
       if (!parsedServer.success) {
@@ -1250,15 +1260,33 @@ function importConfig(fromPath: string, dryRun = false) {
     }
 
     if (dryRun) {
+      const YELLOW = "\x1b[33m";
+      const RESET = "\x1b[0m";
+      const coloredPreview = preview
+        .map((line) =>
+          line.includes("[跳过：疑似 mcp-adapter 自身配置")
+            ? `${YELLOW}${line}${RESET}`
+            : line,
+        )
+        .join("\n");
       process.stdout.write(
-        `\n[Import-DryRun] 以下 ${count} 个服务将被导入至 ${getConfigPath()}：\n\n${preview.join("\n")}\n\n注意：此为预览，尚未实际写入配置。\n`,
+        `\n[Import-DryRun] 以下 ${count} 个服务将被导入至 ${getConfigPath()}：\n\n${coloredPreview}\n\n注意：此为预览，尚未实际写入配置。\n`,
       );
       process.exit(0);
     }
 
     saveConfig(targetConfig);
+    const YELLOW = "\x1b[33m";
+    const RESET = "\x1b[0m";
+    const coloredPreview = preview
+      .map((line) =>
+        line.includes("[跳过：疑似 mcp-adapter 自身配置")
+          ? `${YELLOW}${line}${RESET}`
+          : line,
+      )
+      .join("\n");
     writeLog(
-      `\n[Import] 成功无损迁移了原配置中的 ${count} 个 MCP 服务挂载至 ${getConfigPath()}！\n`,
+      `\n[Import] 成功无损迁移了原配置中的 ${count} 个 MCP 服务挂载至 ${getConfigPath()}！\n\n${coloredPreview}\n`,
     );
   } catch (err) {
     writeLog(
