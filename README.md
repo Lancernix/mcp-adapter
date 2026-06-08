@@ -18,7 +18,7 @@
 - ⏳ **闲置消退与自动降温 (Idle Autorelease)：** 内置 30s 扫描周期的 Sweeper。当底层服务闲置超过指定阈值（默认全局 10 分钟，支持单服务自定义）时，平滑杀死底层子进程并断开连接，彻底释放物理内存。
 - 💀 **死亡守卫 (Parent Death Watch)：** 拦截父进程的 `stdin` 的 `close` 事件与常规终止信号（`SIGINT`/`SIGTERM`），当父进程退出或管道破裂时，立即进入清理流程，尽力关闭所有底层连接与子进程，避免僵尸进程残留。
 - 🔍 **混合工具搜索（BM25 + Fuse.js Token Search + IDF Rerank）：** 搜索层结合轻量 BM25 关键词召回、Fuse.js Token Search 多词模糊匹配，以及 IDF 加权字段命中重排。支持中英混合、中文服务别名、typo、多词乱序搜索。自动降低 `get`/`list`/`search`/`query` 等泛词影响，优先提升工具名、服务别名、稀有关键词的权重。Fuse Token Search 支持 `tokenMatch: "any"` 以保留部分 token 命中的召回能力，中文搜索通过 `Intl.Segmenter` 与 bigram 兜底增强。搜索结果通过 `matchReasons` 输出匹配依据和置信度，帮助模型判断是否可直接执行或需要先 `describe_tool`。
-- 📦 **一键无损迁移 (CLI Config Migration)：** 提供一键 CLI 导入工具，可无损迁移现有的 MCP 声明（如 `~/.claude.json`），根据服务名自动生成基础 aliases，保留源配置中已有 aliases。
+- 📦 **AI 客户端配置导入 (CLI Config Migration)：** 支持 Claude Code 与 OpenCode 配置导入。`mcp-adapter import --client <name> --from <path>` 会解析客户端原生 MCP 配置，生成 adapter 自身的 `config.json`，并可在显式 `--write-client-config` 时把客户端 MCP 区域替换为单个 `mcp-adapter` 入口。导入会自动补充基础 aliases，并在生成的客户端入口中显式写入 `MCP_ADAPTER_HOME`，避免多 agent 共用配置/缓存互相污染。
 
 ---
 
@@ -55,7 +55,7 @@
 
 ### 文件系统布局
 
-网关默认会将配置、缓存和日志保存在当前用户的家目录：
+网关默认会将配置、缓存和日志保存在当前用户的家目录。单客户端默认使用 `~/.mcp-adapter/`；多 agent 并存时建议每个客户端使用独立工作区，例如 OpenCode 使用 `~/.mcp-adapter-opencode/`。
 
 ```bash
 ~/.mcp-adapter/
@@ -63,7 +63,7 @@
 ├── cache.json   # 缓存的所有底层服务的工具 Schema、哈希校验指纹与抓取时间
 └── logs/        # debug=true 时写入的文件日志目录；默认仅输出到 stderr
 ```
-*注：可通过环境变量 `MCP_ADAPTER_HOME` 自定义上述工作根路径。*
+*注：可通过环境变量 `MCP_ADAPTER_HOME` 自定义上述工作根路径，支持 `~` 与 `~/...` 展开。生成的客户端配置会显式写入该变量。*
 
 ---
 
@@ -104,14 +104,35 @@
 
 ### npx 直接使用（推荐）
 
-在 MCP 客户端配置中直接使用 npx，无需提前安装：
+在 MCP 客户端配置中直接使用 npx，无需提前安装。推荐显式写入 `MCP_ADAPTER_HOME`，便于 Claude Code、OpenCode 等多个 AI 客户端隔离配置与缓存。
+
+Claude Code：
 
 ```json
 {
   "mcpServers": {
     "mcp-adapter": {
       "command": "npx",
-      "args": ["-y", "@lancernix/mcp-adapter@latest"]
+      "args": ["-y", "@lancernix/mcp-adapter@latest"],
+      "env": {
+        "MCP_ADAPTER_HOME": "~/.mcp-adapter"
+      }
+    }
+  }
+}
+```
+
+OpenCode：
+
+```json
+{
+  "mcp": {
+    "mcp-adapter": {
+      "type": "local",
+      "command": ["npx", "-y", "@lancernix/mcp-adapter@latest"],
+      "environment": {
+        "MCP_ADAPTER_HOME": "~/.mcp-adapter-opencode"
+      }
     }
   }
 }
@@ -147,35 +168,40 @@ npm link
 # 链接后可在系统任意位置通过 mcp-adapter 命令启动
 ```
 
-### 2. 一键无损迁移
+### 2. 导入现有客户端 MCP 配置
 
-若你此前已在 `~/.claude.json` 中配置了大量的 MCP Server，可以使用内置迁移工具一键导入：
+若你此前已在 Claude Code 或 OpenCode 中配置了大量 MCP Server，可以使用内置导入工具把它们迁移到 mcp-adapter 的独立工作区。
 
-**npx 直接使用（推荐，无需安装）：**
-
-```bash
-# 预览导入内容，不写入（推荐先执行此步骤确认无误）
-npx -y @lancernix/mcp-adapter@latest import --dry-run
-
-# 确认无误后正式导入
-npx -y @lancernix/mcp-adapter@latest import
-```
-
-`--from` 参数可选。默认从 `~/.claude.json` 读取，如果你的配置文件在其他路径，可通过 `--from <path>` 指定。
-
-**npm 全局安装后：**
+**先 dry-run 预览（推荐）：**
 
 ```bash
-mcp-adapter import --dry-run
-mcp-adapter import
+# Claude Code
+npx -y @lancernix/mcp-adapter@latest import --client claude --from ~/.claude.json --dry-run
+
+# OpenCode
+npx -y @lancernix/mcp-adapter@latest import --client opencode --from ~/.config/opencode/opencode.json --dry-run
 ```
 
-**源码构建后：**
+dry-run 会显示源配置、目标 `config.json`、导入/跳过的 server，以及将写回客户端配置的 `mcp-adapter` 入口。
+
+**正式导入 adapter 配置：**
 
 ```bash
-node dist/index.js import --dry-run
-node dist/index.js import
+# Claude Code -> ~/.mcp-adapter/config.json
+npx -y @lancernix/mcp-adapter@latest import --client claude --from ~/.claude.json
+
+# OpenCode -> ~/.mcp-adapter-opencode/config.json
+npx -y @lancernix/mcp-adapter@latest import --client opencode --from ~/.config/opencode/opencode.json
 ```
+
+默认不会修改原客户端配置。确认 dry-run 后，如需把客户端 MCP 区域替换为单个 `mcp-adapter` 入口，显式添加 `--write-client-config`：
+
+```bash
+npx -y @lancernix/mcp-adapter@latest import --client claude --from ~/.claude.json --write-client-config
+npx -y @lancernix/mcp-adapter@latest import --client opencode --from ~/.config/opencode/opencode.json --write-client-config
+```
+
+如果系统中只检测到一个受支持客户端配置，也可以运行 `import --dry-run` 自动预览；正式导入仍建议显式指定 `--client` 与 `--from`，避免误导入。
 
 ---
 
@@ -284,46 +310,39 @@ node dist/index.js import
 
 ## 客户端接入示例
 
-### 在 Claude Code 中接入
-
-**npx 直接使用（推荐）：**
+### Claude Code
 
 ```json
 {
   "mcpServers": {
     "mcp-adapter": {
       "command": "npx",
-      "args": ["-y", "@lancernix/mcp-adapter@latest"]
+      "args": ["-y", "@lancernix/mcp-adapter@latest"],
+      "env": {
+        "MCP_ADAPTER_HOME": "~/.mcp-adapter"
+      }
     }
   }
 }
 ```
 
-**npm 全局安装后：**
+### OpenCode
 
 ```json
 {
-  "mcpServers": {
+  "mcp": {
     "mcp-adapter": {
-      "command": "mcp-adapter"
+      "type": "local",
+      "command": ["npx", "-y", "@lancernix/mcp-adapter@latest"],
+      "environment": {
+        "MCP_ADAPTER_HOME": "~/.mcp-adapter-opencode"
+      }
     }
   }
 }
 ```
 
-**源码构建后：**
-
-```json
-{
-  "mcpServers": {
-    "mcp-adapter": {
-      "command": "node",
-      "args": ["/path/to/mcp-adapter/dist/index.js"]
-    }
-  }
-}
-```
-配置完成后，Claude 冷启动阶段只需加载 mcp-adapter 和 4 个元工具。若 metadata cache 已有效，adapter 不会唤醒真实 MCP；若 cache 缺失或失效，adapter 会在接入客户端后于后台顺序刷新 metadata。若刷新过程中临时创建了连接，则该 server 刷新完成后立即关闭；若该连接正在被其他请求复用，则不会误关，后续交由 idle sweeper 自动释放。Claude 也只会获得 `search_tools` 等 4 个元工具。当 Claude 检索或调用具体功能时，网关将在幕后惰性地调度对应的真实底层进程。
+配置完成后，AI 客户端冷启动阶段只需加载 mcp-adapter 和 4 个元工具。若 metadata cache 已有效，adapter 不会唤醒真实 MCP；若 cache 缺失或失效，adapter 会在接入客户端后于后台顺序刷新 metadata。若刷新过程中临时创建了连接，则该 server 刷新完成后立即关闭；若该连接正在被其他请求复用，则不会误关，后续交由 idle sweeper 自动释放。当 AI 客户端检索或调用具体功能时，网关将在幕后惰性地调度对应的真实底层进程。
 
 ---
 
