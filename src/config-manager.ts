@@ -11,9 +11,15 @@ import type {
   ServerResolveResult,
 } from "./types.js";
 
+function resolveHomePath(input: string): string {
+  if (input === "~") return os.homedir();
+  if (input.startsWith("~/")) return path.join(os.homedir(), input.slice(2));
+  return path.resolve(input);
+}
+
 export function getMcpAdapterHome(): string {
   if (process.env.MCP_ADAPTER_HOME) {
-    return path.resolve(process.env.MCP_ADAPTER_HOME);
+    return resolveHomePath(process.env.MCP_ADAPTER_HOME);
   }
   return path.join(os.homedir(), ".mcp-adapter");
 }

@@ -1,8 +1,4 @@
 #!/usr/bin/env node
-// index.ts - Standard MCP Server Entrypoint for @lancernix/mcp-adapter
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -12,15 +8,23 @@ import {
   isServerCacheValid,
   loadMetadataCache,
 } from "./cache-manager.js";
+// index.ts - Standard MCP Server Entrypoint for @lancernix/mcp-adapter
 import {
-  getConfigPath,
+  applyImportPlan,
+  createImportPlan,
+  detectClientConfigs,
+  formatDetectedClientConfigs,
+  formatKnownClientPaths,
+  getDefaultConfigForClient,
+  inferClientFromDefaultPath,
+  printImportDryRun,
+} from "./client-config/import-service.js";
+import {
   getMcpAdapterHome,
   loadConfig,
   resolveServerHint,
   resolveServerName,
-  saveConfig,
 } from "./config-manager.js";
-import { ServerConfigSchema } from "./config-schema.js";
 import { McpLifecycleManager } from "./lifecycle.js";
 import { setConfigRef, writeLog } from "./logger.js";
 import type { ToolSearchResult } from "./search-index.js";
@@ -1190,107 +1194,88 @@ function locateTool(
 
 // ---- CLI import ----
 
-function isLikelyMcpAdapterSelf(_name: string, config: any): boolean {
-  return JSON.stringify(config).includes("mcp-adapter");
-}
-
-function importConfig(fromPath: string, dryRun = false) {
-  if (!fromPath || !fs.existsSync(fromPath)) {
-    writeLog(`[Error] 找不到源配置文件: ${fromPath}\n`);
+function readCliOption(args: string[], flag: string): string | undefined {
+  const idx = args.indexOf(flag);
+  if (idx === -1) return undefined;
+  const value = args[idx + 1];
+  if (!value || value.startsWith("--")) {
+    writeLog(`[Error] ${flag} 必须跟随一个参数值。\n`);
     process.exit(1);
   }
+  return value;
+}
+
+function runImportCommand(args: string[]): void {
+  const fromArg = readCliOption(args, "--from");
+  let fromPath = fromArg;
+  let clientName = readCliOption(args, "--client");
+  const dryRun = args.includes("--dry-run");
+  const writeClientConfig = args.includes("--write-client-config");
 
   try {
-    const raw = fs.readFileSync(fromPath, "utf-8");
-    const parsed = JSON.parse(raw);
-
-    const sourceServers = parsed.mcpServers;
-
-    if (!sourceServers || typeof sourceServers !== "object") {
-      writeLog("[Error] 源配置文件中未找到顶层 mcpServers。请确认文件格式。\n");
-      process.exit(1);
-    }
-
-    const targetConfig = loadConfig();
-    targetConfig.mcpServers = targetConfig.mcpServers || {};
-
-    let count = 0;
-    const preview: string[] = [];
-
-    for (const [name, serverConfig] of Object.entries(sourceServers)) {
-      if (!serverConfig || typeof serverConfig !== "object") continue;
-
-      // 跳过 mcp-adapter 自身配置，防止循环启动
-      if (isLikelyMcpAdapterSelf(name, serverConfig)) {
-        preview.push(`  ⚠️  ${name} [跳过：疑似 mcp-adapter 自身配置，如需导入请手动添加到 config.json]`);
-        continue;
-      }
-
-      const parsedServer = ServerConfigSchema.safeParse(serverConfig);
-      if (!parsedServer.success) {
-        preview.push(
-          `  - ${name} [跳过：配置格式非法] ${parsedServer.error.issues
-            .map((i) => `${i.path.join(".")}: ${i.message}`)
-            .join("; ")}`,
+    if (fromPath && !clientName) {
+      const inferred = inferClientFromDefaultPath(fromPath);
+      if (!inferred) {
+        throw new Error(
+          "使用非默认路径 --from 时必须同时指定 --client <name>，用于确定导入格式和目标配置。",
         );
-        continue;
       }
-
-      const srv = parsedServer.data;
-
-      const aliasSet = new Set<string>([name]);
-      const parts = name.split(/[-_\s]+/);
-      for (const part of parts) {
-        if (part.length > 2) aliasSet.add(part);
-      }
-
-      const existingAliases = Array.isArray(srv.aliases) ? srv.aliases : [];
-
-      const imported: ServerConfig = {
-        ...srv,
-        lifecycle: srv.lifecycle ?? "lazy",
-        aliases: Array.from(new Set([...existingAliases, ...aliasSet])),
-      };
-
-      targetConfig.mcpServers[name] = imported;
-      preview.push(
-        `  - ${name} (${imported.type ?? "stdio"})${imported.disabled ? " [已禁用]" : ""} aliases: [${imported.aliases?.join(", ")}]`,
-      );
-      count++;
+      clientName = inferred.client.name;
     }
+
+    if (!fromPath && clientName) {
+      fromPath = getDefaultConfigForClient(clientName);
+      if (!fromPath) {
+        throw new Error(
+          `未找到 client=${clientName} 的默认配置文件，或该配置文件不包含受支持的 MCP 配置。请使用 --from <path> 指定源配置。`,
+        );
+      }
+    }
+
+    if (!fromPath || !clientName) {
+      const detected = detectClientConfigs();
+      if (detected.length === 1) {
+        const [source] = detected;
+        if (!dryRun) {
+          throw new Error(
+            `自动检测到 ${source.client.displayName} 配置: ${source.path}\n` +
+              "请先运行 --dry-run 确认，或显式指定 --client 与 --from 后再正式导入。\n" +
+              `示例: mcp-adapter import --client ${source.client.name} --from ${source.path}`,
+          );
+        }
+        clientName = source.client.name;
+        fromPath = source.path;
+      } else if (detected.length > 1) {
+        throw new Error(
+          "检测到多个 AI 客户端配置文件，请使用 --client 和 --from 明确指定：\n" +
+            formatDetectedClientConfigs(detected),
+        );
+      } else {
+        throw new Error(
+          "未找到源配置文件。请使用 --client <name> --from <path> 指定客户端和配置路径。\n" +
+            "已知默认路径：\n" +
+            formatKnownClientPaths(),
+        );
+      }
+    }
+
+    const plan = createImportPlan({ clientName, fromPath });
 
     if (dryRun) {
-      const YELLOW = "\x1b[33m";
-      const RESET = "\x1b[0m";
-      const coloredPreview = preview
-        .map((line) =>
-          line.includes("[跳过：疑似 mcp-adapter 自身配置")
-            ? `${YELLOW}${line}${RESET}`
-            : line,
-        )
-        .join("\n");
-      process.stdout.write(
-        `\n[Import-DryRun] 以下 ${count} 个服务将被导入至 ${getConfigPath()}：\n\n${coloredPreview}\n\n注意：此为预览，尚未实际写入配置。\n`,
-      );
+      printImportDryRun(plan);
       process.exit(0);
     }
 
-    saveConfig(targetConfig);
-    const YELLOW = "\x1b[33m";
-    const RESET = "\x1b[0m";
-    const coloredPreview = preview
-      .map((line) =>
-        line.includes("[跳过：疑似 mcp-adapter 自身配置")
-          ? `${YELLOW}${line}${RESET}`
-          : line,
-      )
-      .join("\n");
+    applyImportPlan(plan, { writeClientConfig });
     writeLog(
-      `\n[Import] 成功无损迁移了原配置中的 ${count} 个 MCP 服务挂载至 ${getConfigPath()}！\n\n${coloredPreview}\n`,
+      `\n[Import] 成功导入 ${plan.importedServers.length} 个 MCP 服务至 ${plan.adapterConfigPath}。\n` +
+        (writeClientConfig
+          ? `[Import] 已回写 ${plan.client.displayName} 配置: ${plan.sourcePath}\n`
+          : "[Import] 未回写 client 配置。如需替换原配置，请重新运行并添加 --write-client-config。\n"),
     );
   } catch (err) {
     writeLog(
-      `[Import-Error] 迁移失败: ${err instanceof Error ? err.message : String(err)}\n`,
+      `[Import-Error] ${err instanceof Error ? err.message : String(err)}\n`,
     );
     process.exit(1);
   }
@@ -1302,26 +1287,7 @@ async function main() {
   const args = process.argv.slice(2);
 
   if (args[0] === "import") {
-    const fromIdx = args.indexOf("--from");
-    let fromPath = fromIdx !== -1 ? args[fromIdx + 1] : undefined;
-    const dryRun = args.includes("--dry-run");
-
-    if (!fromPath) {
-      const candidate = path.join(os.homedir(), ".claude.json");
-      if (fs.existsSync(candidate)) {
-        fromPath = candidate;
-      }
-    }
-
-    if (!fromPath || !fs.existsSync(fromPath)) {
-      writeLog(
-        "[Error] 未找到源配置文件。用法: mcp-adapter import [--from <path>] [--dry-run]\n" +
-          "默认从 ~/.claude.json 读取，也可通过 --from 指定其他路径。\n",
-      );
-      process.exit(1);
-    }
-
-    importConfig(fromPath, dryRun);
+    runImportCommand(args);
     return;
   }
 
