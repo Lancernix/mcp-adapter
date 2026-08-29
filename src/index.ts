@@ -40,6 +40,7 @@ import type {
   JsonSchema,
   ServerConfig,
 } from "./types.js";
+import { GATEWAY_VERSION } from "./version.js";
 
 // ---- zod schema ----
 
@@ -445,7 +446,7 @@ function disabledServerText(serverName: string): string {
 const mcpServer = new McpServer(
   {
     name: "mcp-adapter",
-    version: "1.0.0",
+    version: GATEWAY_VERSION,
   },
   {
     capabilities: {

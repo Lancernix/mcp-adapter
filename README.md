@@ -5,18 +5,19 @@
 在重度 AI 编码或智能体协同场景中，注册过多的 MCP 服务常会面临以下致命痛点：
 1. **Context 迅速暴涨：** 数十个 MCP 服务对应的数百个工具 Schema 统统塞入 System Prompt，每次对话前置开销可能高达数万 Token。
 2. **冷启动极慢且极耗内存：** 每次 AI 客户端（如 Claude Code CLI）冷启动时，会瞬间并发拉起几十个物理子进程，内存开销数以 GB 计。在 2GB RAM 等低配云主机上会导致卡死或进程被 OOM 强杀。
-3. **残留僵尸进程：** 父进程异常暴毙时，被拉起的底层 MCP 服务子进程无法释放，沦为僵尸进程霸占系统资源。
 
-`@lancernix/mcp-adapter` 采用 **“元工具拦截 + JIT 惰性唤醒 + 自消退释放 + 管道死亡守卫”** 的四重保障，完美解决上述痛点。
+`@lancernix/mcp-adapter` 采用 **“元工具拦截 + JIT 惰性唤醒 + 自消退释放 + 有序退出清理”** 的四重机制，解决上述痛点。
+
+> 关于第 4 点需要说明边界：有序退出清理覆盖的是有退出信号的场景（终端关闭、`Ctrl+C`、客户端正常退出）。`kill -9`、OOM 这类强制终止下，adapter 自身随客户端一起被杀，来不及执行清理，底层子进程仍会成为孤儿进程——这是子进程模型的结构性限制，不由网关决定。长运行内存控制的真正主力是 idle sweeper。
 
 ---
 
 ## 核心特性
 
-- 🛡️ **Context Token 挽救：** 物理拦截真实 Tools 的入参 Schema。网关对外**仅暴露 4 个元工具**（`search_tools`, `list_tools`, `describe_tool`, `execute_tool`），将大模型 System Prompt 阶段的工具提示词开销骤降 **95% 以上**。其中 `search_tools` 返回完整 `inputSchema`，通常可直接进入 `execute_tool`；`list_tools` 提供轻量全量工具名目录作为兜底。
+- 🛡️ **Context Token 挽救：** 物理拦截真实 Tools 的入参 Schema。网关对外**仅暴露 4 个元工具**（`search_tools`, `list_tools`, `describe_tool`, `execute_tool`），将大模型 System Prompt 阶段的工具提示词开销骤降 **95% 以上**（按数十服务、数百工具的典型场景估算，实际取决于底层工具数量与 Schema 复杂度）。其中 `search_tools` 返回完整 `inputSchema`，通常可直接进入 `execute_tool`；`list_tools` 提供轻量全量工具名目录作为兜底。
 - ⚡ **冷启动与惰性 JIT 唤醒 (Lazy Loading)：** 当 metadata cache 有效时，adapter 启动不会唤醒任何底层 MCP server。首次 cache 为空或部分失效时，adapter 会先接入客户端，再在后台顺序刷新缺失 metadata；每个 server 刷新完成后，若连接由 metadata refresh 临时创建则立即关闭；若该连接正在被其他请求复用则不会误关，后续交由 idle sweeper 自动释放。
 - ⏳ **闲置消退与自动降温 (Idle Autorelease)：** 内置 30s 扫描周期的 Sweeper。当底层服务闲置超过指定阈值（默认全局 10 分钟，支持单服务自定义）时，平滑杀死底层子进程并断开连接，彻底释放物理内存。
-- 💀 **死亡守卫 (Parent Death Watch)：** 拦截父进程的 `stdin` 的 `close` 事件与常规终止信号（`SIGINT`/`SIGTERM`），当父进程退出或管道破裂时，立即进入清理流程，尽力关闭所有底层连接与子进程，避免僵尸进程残留。
+- 🧹 **有序退出清理 (Graceful Shutdown)：** 监听父进程 `stdin` 的 `close` 事件与常规终止信号（`SIGINT`/`SIGTERM`），触发后统一走 `shutdownAndExit`：移除监听器并加 once guard 防重入 → 停止 sweeper → 按「半吊子资源 → pending 连接 → 存量连接」顺序清理 → `process.exit(0)`。覆盖终端关闭、`Ctrl+C`、客户端正常退出等有退出信号的场景；不适用于 `kill -9` / OOM 等强制终止。
 - 🔍 **混合工具搜索（BM25 + Fuse.js Token Search + IDF Rerank）：** 搜索层结合轻量 BM25 关键词召回、Fuse.js Token Search 多词模糊匹配，以及 IDF 加权字段命中重排。支持中英混合、中文服务别名、typo、多词乱序搜索。自动降低 `get`/`list`/`search`/`query` 等泛词影响，优先提升工具名、服务别名、稀有关键词的权重。Fuse Token Search 支持 `tokenMatch: "any"` 以保留部分 token 命中的召回能力，中文搜索通过 `Intl.Segmenter` 与 bigram 兜底增强。搜索结果通过 `matchReasons` 输出匹配依据和置信度，帮助模型判断是否可直接执行或需要先 `describe_tool`。
 - 📦 **AI 客户端配置导入 (CLI Config Migration)：** 支持 Claude Code 与 OpenCode 配置导入。`mcp-adapter import --client <name> --from <path>` 会解析客户端原生 MCP 配置，生成 adapter 自身的 `config.json`，并可在显式 `--write-client-config` 时把客户端 MCP 区域替换为单个 `mcp-adapter` 入口。导入会自动补充基础 aliases，并在生成的客户端入口中显式写入 `MCP_ADAPTER_HOME`，避免多 agent 共用配置/缓存互相污染。
 
@@ -82,7 +83,7 @@
 * **设计细节：** 仅返回工具名，不返回描述和参数 Schema。用于 `search_tools` 结果不理想时的目录式兜底浏览。看到疑似工具名后，再调用 `describe_tool` 获取完整 schema。
 * **参数：**
   * `server` (string, 必填): 服务名或 aliases。
-  * `limit` (number, 可选): 最多返回工具数量，默认全量，最大 500。
+  * `limit` (number, 可选): 返回条数，取值 1–500，默认 500。工具数超过返回条数时会截断并在结果末尾给出提示；传入超过 500 的值会被参数校验拒绝。
 
 ### 3. `describe_tool`
 * **功能：** 获取指定单个工具的完整定义与入参 Schema。
@@ -168,7 +169,7 @@ npm link
 # 链接后可在系统任意位置通过 mcp-adapter 命令启动
 ```
 
-### 2. 导入现有客户端 MCP 配置
+### 导入现有客户端 MCP 配置
 
 若你此前已在 Claude Code 或 OpenCode 中配置了大量 MCP Server，可以使用内置导入工具把它们迁移到 mcp-adapter 的独立工作区。
 
@@ -249,18 +250,18 @@ npx -y @lancernix/mcp-adapter@latest import --client opencode --from ~/.config/o
 | 字段 | 类型 | 默认值 | 描述 |
 | :--- | :--- | :--- | :--- |
 | `idleTimeout` | `number` | `10` | 默认全局子进程闲置自动退出的时间（单位：分钟） |
-| `cacheTtlDays` | `number` | `7` | 工具缓存的有效生存期（天），过期后会在后台 bootstrap、search_tools/describe_tool 明确定位 server 时自动刷新。设为 `0` 表示缓存不因 TTL 过期（仅在 server 配置哈希变化时自动刷新） |
+| `cacheTtlDays` | `number` | `7` | 工具缓存的有效生存期（天），过期后会在后台 bootstrap、search_tools/describe_tool/list_tools 明确定位 server 时自动刷新。设为 `0` 表示缓存不因 TTL 过期（仅在 server 配置哈希变化时自动刷新） |
 | `toolSearchLimit` | `number` | `10` | `search_tools` 默认返回数量。单次调用最大 20 |
 | `metadataBootstrap` | `"background"` \| `"off"` | `"background"` | 启动后是否在后台自动刷新缺失/失效的 metadata 缓存 |
 | `debug` | `boolean` | `false` | 是否开启文件日志。默认仅输出到 stderr；设为 `true` 后会额外写入 `logs/mcp-adapter.log`。日志持续追加，请仅在排查问题时开启并定期清理 |
 | `connectTimeoutMs` | `number` | `60000` | 连接底层 MCP 服务的超时时间（毫秒）。设为 `0` 表示禁用超时 |
 | `requestTimeoutMs` | `number` | `60000` | `listTools` / `callTool` 等请求的超时时间（毫秒）。设为 `0` 表示禁用超时 |
-| `closeTimeoutMs` | `number` | `10000` | 关闭底层连接的超时时间（毫秒）。设为 `0` 表示禁用超时 |
+| `closeTimeoutMs` | `number` | `10000` | 关闭底层连接的超时时间（毫秒）。设为 `0` 表示禁用超时（例外：进程退出清理为保证可靠退出，即使设为 `0` 也会按 10 秒执行） |
 
 ### 服务专属 `mcpServers` 配置项
 除了标准的 `command`、`args`、`env`、`cwd` 字段，网关新增了如下扩展配置：
 * `type` (string, 默认 `"stdio"`): 连接方式。
-  * `"stdio"`: 本地子进程（需配置 `command` + `args`）。
+  * `"stdio"`: 本地子进程（需配置 `command`，`args` 可选）。
   * `"http"` / `"sse"`: 远程服务（需配置 `url`，可选 `headers`）。
 * `url` (string, HTTP/SSE 必填): 远程 MCP 服务端点地址。
 * `headers` (object, 可选): HTTP/SSE 请求附加的自定义请求头。
@@ -360,7 +361,7 @@ npx -y @lancernix/mcp-adapter@latest import --client opencode --from ~/.config/o
 > MCP 协议定义了三种能力：Tools、Prompts、Resources。当前 `mcp-adapter` 仅缓存和代理 Tools，原因：
 > * **Tools** 是唯一有数量爆炸问题的能力——几十个服务 × 几十个工具 × 复杂 Schema = 数万 token 上下文开销，必须拦截。
 > * **Prompts** 生态未成熟，Claude Code 当前版本不支持 MCP Prompts，实际无人使用。
-> * **Resources** 数量通常很少（每个服务 5-10 个），且通过 URI 直接引用（`@server:resource/path`），不需要模糊搜索发现。
+> * **Resources** 数量通常很少（每个服务 5-10 个），且一般通过 URI 直接引用，不依赖模糊搜索发现。
 
 ### 缓存哈希
 网关通过 **黑名单策略** 计算每个服务的配置指纹：排除 `aliases`、`lifecycle`、`disabled`、`idleTimeout`、`refreshOnStartup`、`connectTimeoutMs`、`requestTimeoutMs`、`closeTimeoutMs` 等 adapter 元数据字段，其余所有字段（`type`、`command`、`args`、`env`、`cwd`、`url`、`headers` 及未来新增字段）全部纳入 SHA256。配置不变则复用缓存，变更则自动重新发现。
@@ -368,8 +369,9 @@ npx -y @lancernix/mcp-adapter@latest import --client opencode --from ~/.config/o
 ### 代码规范与自愈
 * 项目基于 TypeScript 编写。修改代码后，需执行 `npm run build` 生成生产 JavaScript。
 * 底层通信严格遵循官方标准 MCP 协议，支持 SDK 内置的 Stdio、Streamable HTTP、SSE 三种传输方式。认证信息可通过 `headers` 或 `env` 配置传入。
-* 代码使用 biome 作为 linter/formatter，TS 编译启用 `strict` 模式。已消除所有显式 `any`（仅保留一处 SDK 类型兼容所需的 `as any`）和非空断言。
+* 代码使用 biome 作为 linter/formatter，TS 编译启用 `strict` 模式。已消除所有显式 `any` 和非空断言（类型断言均为具体类型，如 `as unknown as MetadataCache`，无 `as any`）。
 
-### 进程看护
+### 进程生命周期
 * 强烈建议在低配 VPS 上开启 `"lifecycle": "lazy"`。网关会在高频调用后进入闲置轮询，将进程优雅退温，宿主机将始终保持轻量健康的负载表现。
-* 父进程崩溃或管道断开时，Death Watch 守卫会在统一的 `shutdownAndExit` 流程中先移除 `stdin.close` / `SIGINT` / `SIGTERM` 监听器，并通过 once guard 防止二次清理。
+* 收到 `stdin.close` / `SIGINT` / `SIGTERM` 时，统一的 `shutdownAndExit` 流程会先移除这些监听器，并通过 once guard 防止二次清理，随后按顺序释放全部底层连接与子进程。
+* 这套清理只在**有退出信号**的前提下生效。若父进程被 `kill -9` 或 OOM 强杀，网关自身来不及执行任何清理，底层子进程将残留为孤儿进程。这类场景需要在宿主机层面兜底（如进程组 kill、容器生命周期钩子）。

@@ -14,6 +14,7 @@ import { buildChildEnv, resolveCwd } from "./config-manager.js";
 import { writeLog } from "./logger.js";
 import { TimeoutError, withTimeout } from "./timeout.js";
 import type { ConnectOptions, ServerConfig } from "./types.js";
+import { GATEWAY_VERSION } from "./version.js";
 
 export interface ServerConnection {
   client: Client;
@@ -123,7 +124,7 @@ export class McpServerManager {
     const client = new Client(
       {
         name: `mcp-adapter-client-for-${name}`,
-        version: "1.0.0",
+        version: GATEWAY_VERSION,
       },
       {
         capabilities: {},
