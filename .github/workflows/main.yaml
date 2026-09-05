@@ -1,0 +1,94 @@
+# CI on master + tag 触发的 npm 发布。
+#
+# 发布采用 npm Trusted Publishing（OIDC，零 token）。前置条件（一次性，在
+# npmjs.com → 包设置 → Trusted Publisher 中配置）：
+#   Provider: GitHub Actions ｜ Owner: Lancernix ｜ Repository: mcp-adapter
+#   Workflow: main.yaml ｜ Environment: release
+# 其余条件已满足：id-token: write 权限、Node 24 自带 npm ≥ 11.5.1、
+# GitHub-hosted runner、发布步骤使用 npm CLI。
+# 之后发布流程：合并到 master → 打 tag `v<x.y.z>`（须与 package.json version 一致）
+# → 自动校验、构建、发布到 npm（含 provenance）并创建 GitHub Release。
+name: CI / Release
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - 'v*'
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    name: Test & Build
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Lint and type check
+        run: pnpm run check
+
+      - name: Build
+        run: pnpm run build
+
+      - name: Unit tests
+        run: pnpm test
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: quality
+    runs-on: ubuntu-latest
+    environment: release
+    name: Publish to NPM
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Verify tag matches package.json version
+        run: |
+          PKG_VERSION="v$(node -p "require('./package.json').version")"
+          if [ "$PKG_VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package.json version $PKG_VERSION"
+            exit 1
+          fi
+          echo "Tag matches package.json version: $PKG_VERSION"
+
+      - name: Build
+        run: pnpm run build
+
+      - name: Publish to NPM
+        run: npm publish --provenance
+
+      - name: Create GitHub Release
+        run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

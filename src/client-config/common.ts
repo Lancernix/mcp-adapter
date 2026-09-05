@@ -38,11 +38,20 @@ export function readJsonLike(filePath: string): Record<string, unknown> {
 
 export function writeJsonAtomic(filePath: string, value: unknown): void {
   const tmpPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tmpPath, `${JSON.stringify(value, null, 2)}\n`, {
-    encoding: "utf-8",
-    mode: 0o600,
-  });
-  fs.renameSync(tmpPath, filePath);
+  try {
+    fs.writeFileSync(tmpPath, `${JSON.stringify(value, null, 2)}\n`, {
+      encoding: "utf-8",
+      mode: 0o600,
+    });
+    fs.renameSync(tmpPath, filePath);
+  } catch (err) {
+    if (fs.existsSync(tmpPath)) {
+      try {
+        fs.unlinkSync(tmpPath);
+      } catch {}
+    }
+    throw err;
+  }
   try {
     fs.chmodSync(filePath, 0o600);
   } catch {}

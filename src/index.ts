@@ -4,6 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import {
+  filterServerTools,
   getValidCachedServers,
   isServerCacheValid,
   loadMetadataCache,
@@ -40,6 +41,7 @@ import type {
   JsonSchema,
   ServerConfig,
 } from "./types.js";
+import { GATEWAY_VERSION } from "./version.js";
 
 // ---- zod schema ----
 
@@ -227,6 +229,10 @@ async function bootstrapServersSequentially(
           connectTimeoutMs: config.settings?.connectTimeoutMs,
           requestTimeoutMs: config.settings?.requestTimeoutMs,
           closeTimeoutMs: config.settings?.closeTimeoutMs,
+          failureBackoffMs: config.settings?.failureBackoffMs,
+          // 后台 bootstrap 的瞬时失败（如 npx 冷启动下载慢）不记录冷却，
+          // 否则会把前台对该服务的 search/execute 拒之门外长达一个冷却窗口
+          recordFailureBackoff: false,
           closeIfCreated: true,
           forceRefresh: srvConfig.refreshOnStartup === true,
         },
@@ -317,6 +323,7 @@ async function ensureServerMetadata(serverName: string): Promise<boolean> {
       connectTimeoutMs: config.settings?.connectTimeoutMs,
       requestTimeoutMs: config.settings?.requestTimeoutMs,
       closeTimeoutMs: config.settings?.closeTimeoutMs,
+      failureBackoffMs: config.settings?.failureBackoffMs,
       closeIfCreated: true,
     });
 
@@ -445,7 +452,7 @@ function disabledServerText(serverName: string): string {
 const mcpServer = new McpServer(
   {
     name: "mcp-adapter",
-    version: "1.0.0",
+    version: GATEWAY_VERSION,
   },
   {
     capabilities: {
@@ -902,6 +909,16 @@ mcpServer.registerTool(
           `[mcp-adapter] 未能定位到工具 "${toolInput}"，请使用 search_tools 重新搜索。`,
         );
       }
+      // 无缓存兜底路径同样尊重 includeTools/excludeTools：被排除的工具不可执行
+      const targetCfg = config.mcpServers[resolved.server];
+      if (
+        targetCfg &&
+        filterServerTools([{ name: resolved.tool }], targetCfg).length === 0
+      ) {
+        throw new Error(
+          `[mcp-adapter] 工具 "${resolved.tool}" 已被服务 [${resolved.server}] 的 includeTools/excludeTools 配置排除，无法执行。如需恢复请调整 config.json 中的过滤配置。`,
+        );
+      }
       serverName = resolved.server;
       originalName = resolved.tool;
     }
@@ -926,6 +943,7 @@ mcpServer.registerTool(
           serverConfig.requestTimeoutMs ?? config.settings?.requestTimeoutMs,
         closeTimeoutMs:
           serverConfig.closeTimeoutMs ?? config.settings?.closeTimeoutMs,
+        failureBackoffMs: config.settings?.failureBackoffMs,
       };
       conn = await serverManager.connect(serverName, serverConfig, options);
     } catch (err) {

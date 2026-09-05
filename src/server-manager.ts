@@ -11,9 +11,11 @@ import {
   saveMetadataCache,
 } from "./cache-manager.js";
 import { buildChildEnv, resolveCwd } from "./config-manager.js";
+import { FailureBackoff } from "./failure-backoff.js";
 import { writeLog } from "./logger.js";
 import { TimeoutError, withTimeout } from "./timeout.js";
 import type { ConnectOptions, ServerConfig } from "./types.js";
+import { GATEWAY_VERSION } from "./version.js";
 
 export interface ServerConnection {
   client: Client;
@@ -30,6 +32,33 @@ export interface ConnectResult {
   reusedPending: boolean;
 }
 
+/**
+ * 组装 HTTP/SSE 请求头：显式 headers 优先；配置了 bearerTokenEnv 且未显式
+ * 声明 Authorization 时，从环境变量读取 token 注入 Bearer 头，
+ * 避免明文 token 写入 config.json。
+ */
+export function resolveHttpHeaders(
+  name: string,
+  config: ServerConfig,
+  env: Record<string, string | undefined> = process.env,
+): Record<string, string> {
+  const headers: Record<string, string> = { ...(config.headers ?? {}) };
+  const hasAuthHeader = Object.keys(headers).some(
+    (key) => key.toLowerCase() === "authorization",
+  );
+  if (config.bearerTokenEnv && !hasAuthHeader) {
+    const token = env[config.bearerTokenEnv];
+    if (!token) {
+      throw new Error(
+        `[ServerManager] 服务 [${name}] 配置了 bearerTokenEnv("${config.bearerTokenEnv}")，` +
+          `但当前环境变量未设置或为空`,
+      );
+    }
+    headers.Authorization = `Bearer ${token}`;
+  }
+  return headers;
+}
+
 export class McpServerManager {
   private connections = new Map<string, ServerConnection>();
   private connectPromises = new Map<string, Promise<ServerConnection>>();
@@ -40,6 +69,7 @@ export class McpServerManager {
     { client: Client; transport: Transport }
   >();
   private shuttingDown = false;
+  private failureBackoff = new FailureBackoff();
 
   /**
    * 建立对指定子进程的惰性 MCP 连接 (JIT Cold Start)
@@ -96,6 +126,17 @@ export class McpServerManager {
       };
     }
 
+    // 4. 失败冷却检查：最近一次连接失败且仍在冷却窗口内时快速失败，
+    //    避免每次调用都重新付出完整的连接超时等待（已连接/在建连的情况不受影响）
+    const backoffMs = options?.failureBackoffMs ?? 60000;
+    const backoffRemaining = this.failureBackoff.remainingMs(name, backoffMs);
+    if (backoffRemaining !== null) {
+      throw new Error(
+        `[ServerManager] 服务 [${name}] 最近一次连接失败，正在冷却（剩余 ${Math.ceil(backoffRemaining / 1000)}s）。` +
+          `可稍后重试；若确认已修复，可将 settings.failureBackoffMs 设为 0 关闭冷却后重试`,
+      );
+    }
+
     const promise = this.createConnection(name, config, options);
     this.connectPromises.set(name, promise);
 
@@ -123,7 +164,7 @@ export class McpServerManager {
     const client = new Client(
       {
         name: `mcp-adapter-client-for-${name}`,
-        version: "1.0.0",
+        version: GATEWAY_VERSION,
       },
       {
         capabilities: {},
@@ -144,6 +185,8 @@ export class McpServerManager {
 
       this.pendingResources.delete(name);
 
+      this.failureBackoff.clear(name);
+
       return {
         client,
         transport,
@@ -153,6 +196,9 @@ export class McpServerManager {
       };
     } catch (err) {
       this.pendingResources.delete(name);
+      if (options?.recordFailureBackoff !== false) {
+        this.failureBackoff.recordFailure(name);
+      }
 
       // 捕获异常，彻底释放句柄并关闭进程，防止泄漏僵尸
       const cleanupTimeoutMs =
@@ -190,9 +236,10 @@ export class McpServerManager {
         config.type === "sse"
           ? SSEClientTransport
           : StreamableHTTPClientTransport;
+
       return new TransportClass(new URL(config.url), {
         requestInit: {
-          headers: config.headers ?? {},
+          headers: resolveHttpHeaders(name, config),
         },
       });
     }
@@ -217,7 +264,7 @@ export class McpServerManager {
     return new StdioClientTransport({
       command: config.command,
       args,
-      env: buildChildEnv(env),
+      env: buildChildEnv(env, config.inheritEnv !== false),
       cwd: resolveCwd(config.cwd),
     });
   }
@@ -350,6 +397,8 @@ export class McpServerManager {
       requestTimeoutMs?: number;
       connectTimeoutMs?: number;
       closeTimeoutMs?: number;
+      failureBackoffMs?: number;
+      recordFailureBackoff?: boolean;
       closeIfCreated?: boolean;
       forceRefresh?: boolean;
     },
@@ -379,6 +428,8 @@ export class McpServerManager {
       requestTimeoutMs?: number;
       connectTimeoutMs?: number;
       closeTimeoutMs?: number;
+      failureBackoffMs?: number;
+      recordFailureBackoff?: boolean;
       closeIfCreated?: boolean;
       forceRefresh?: boolean;
     },
@@ -398,6 +449,8 @@ export class McpServerManager {
     const result = await this.connectWithMeta(name, config, {
       connectTimeoutMs: options?.connectTimeoutMs,
       closeTimeoutMs: options?.closeTimeoutMs,
+      failureBackoffMs: options?.failureBackoffMs,
+      recordFailureBackoff: options?.recordFailureBackoff,
     });
 
     const conn = result.conn;

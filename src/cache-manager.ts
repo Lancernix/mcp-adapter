@@ -5,6 +5,7 @@ import fs from "node:fs";
 import { ensureDirs, getCachePath } from "./config-manager.js";
 import type {
   AdapterConfig,
+  CachedTool,
   MetadataCache,
   ServerCacheEntry,
   ServerConfig,
@@ -116,6 +117,7 @@ export function stableStringify(value: unknown): string {
 }
 
 // adapter 元数据字段——不影响底层 server 暴露什么工具，哈希计算时排除
+// （includeTools/excludeTools 是 adapter 侧的可见性过滤，调整它不应触发重新发现）
 const META_KEYS = new Set([
   "aliases",
   "lifecycle",
@@ -125,6 +127,8 @@ const META_KEYS = new Set([
   "connectTimeoutMs",
   "requestTimeoutMs",
   "closeTimeoutMs",
+  "includeTools",
+  "excludeTools",
 ]);
 
 /**
@@ -168,6 +172,7 @@ export function isServerCacheValid(
 /**
  * 从全量缓存中过滤出 configHash 有效、TTL 未过期、且未被 disabled 的 server 缓存条目。
  * 确保 search_tools / describe_tool / locateTool 只使用当前配置对应的有效缓存。
+ * 同时按服务级的 includeTools/excludeTools 对工具列表做可见性过滤。
  */
 export function getValidCachedServers(
   config: AdapterConfig,
@@ -184,9 +189,51 @@ export function getValidCachedServers(
 
     const entry = cache.servers[serverName];
     if (isServerCacheValid(entry, serverConfig, maxAgeMs)) {
-      result[serverName] = entry;
+      const tools = filterServerTools(entry.tools, serverConfig);
+      result[serverName] = tools === entry.tools ? entry : { ...entry, tools };
     }
   }
 
   return result;
+}
+
+const GLOB_REGEXP_CACHE = new Map<string, RegExp>();
+
+/** 支持通配符 * 和 ? 的简单 glob → RegExp；无通配符时即为精确匹配 */
+export function toolPatternToRegExp(pattern: string): RegExp {
+  const cached = GLOB_REGEXP_CACHE.get(pattern);
+  if (cached) return cached;
+  const source = pattern
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*/g, ".*")
+    .replace(/\?/g, ".");
+  const regexp = new RegExp(`^${source}$`);
+  GLOB_REGEXP_CACHE.set(pattern, regexp);
+  return regexp;
+}
+
+function matchesToolPattern(toolName: string, patterns: string[]): boolean {
+  return patterns.some(
+    (p) => p === toolName || toolPatternToRegExp(p).test(toolName),
+  );
+}
+
+/**
+ * 按服务的 includeTools/excludeTools 过滤工具列表（exclude 在 include 之后应用）。
+ * 未配置任何过滤时原样返回同一数组引用。
+ */
+export function filterServerTools(
+  tools: CachedTool[],
+  cfg: Pick<ServerConfig, "includeTools" | "excludeTools">,
+): CachedTool[] {
+  const include = cfg.includeTools?.filter((p) => p.length > 0) ?? [];
+  const exclude = cfg.excludeTools?.filter((p) => p.length > 0) ?? [];
+  if (include.length === 0 && exclude.length === 0) return tools;
+
+  return tools.filter((t) => {
+    if (include.length > 0 && !matchesToolPattern(t.name, include))
+      return false;
+    if (exclude.length > 0 && matchesToolPattern(t.name, exclude)) return false;
+    return true;
+  });
 }
