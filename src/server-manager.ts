@@ -32,6 +32,33 @@ export interface ConnectResult {
   reusedPending: boolean;
 }
 
+/**
+ * 组装 HTTP/SSE 请求头：显式 headers 优先；配置了 bearerTokenEnv 且未显式
+ * 声明 Authorization 时，从环境变量读取 token 注入 Bearer 头，
+ * 避免明文 token 写入 config.json。
+ */
+export function resolveHttpHeaders(
+  name: string,
+  config: ServerConfig,
+  env: Record<string, string | undefined> = process.env,
+): Record<string, string> {
+  const headers: Record<string, string> = { ...(config.headers ?? {}) };
+  const hasAuthHeader = Object.keys(headers).some(
+    (key) => key.toLowerCase() === "authorization",
+  );
+  if (config.bearerTokenEnv && !hasAuthHeader) {
+    const token = env[config.bearerTokenEnv];
+    if (!token) {
+      throw new Error(
+        `[ServerManager] 服务 [${name}] 配置了 bearerTokenEnv("${config.bearerTokenEnv}")，` +
+          `但当前环境变量未设置或为空`,
+      );
+    }
+    headers.Authorization = `Bearer ${token}`;
+  }
+  return headers;
+}
+
 export class McpServerManager {
   private connections = new Map<string, ServerConnection>();
   private connectPromises = new Map<string, Promise<ServerConnection>>();
@@ -208,24 +235,9 @@ export class McpServerManager {
           ? SSEClientTransport
           : StreamableHTTPClientTransport;
 
-      const headers: Record<string, string> = { ...(config.headers ?? {}) };
-      const hasAuthHeader = Object.keys(headers).some(
-        (key) => key.toLowerCase() === "authorization",
-      );
-      if (config.bearerTokenEnv && !hasAuthHeader) {
-        const token = process.env[config.bearerTokenEnv];
-        if (!token) {
-          throw new Error(
-            `[ServerManager] 服务 [${name}] 配置了 bearerTokenEnv("${config.bearerTokenEnv}")，` +
-              `但当前环境变量未设置或为空`,
-          );
-        }
-        headers.Authorization = `Bearer ${token}`;
-      }
-
       return new TransportClass(new URL(config.url), {
         requestInit: {
-          headers,
+          headers: resolveHttpHeaders(name, config),
         },
       });
     }

@@ -4,12 +4,14 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
 import {
+  computeServerHash,
   filterServerTools,
+  getValidCachedServers,
   toolPatternToRegExp,
 } from "../src/cache-manager.js";
 import { buildChildEnv } from "../src/config-manager.js";
 import { FailureBackoff } from "../src/failure-backoff.js";
-import type { CachedTool } from "../src/types.js";
+import type { AdapterConfig, CachedTool, MetadataCache } from "../src/types.js";
 
 // ---- helpers ----
 
@@ -76,6 +78,68 @@ describe("filterServerTools", () => {
     const regexp = toolPatternToRegExp("a.b+c");
     assert.ok(regexp.test("a.b+c"));
     assert.ok(!regexp.test("axbyc"));
+  });
+});
+
+// ---- getValidCachedServers：工具过滤端到端 ----
+
+describe("getValidCachedServers 工具过滤", () => {
+  function makeConfig(serverCfg: Record<string, unknown>): AdapterConfig {
+    return {
+      version: 1,
+      settings: {},
+      mcpServers: {
+        srv: { type: "stdio", command: "node", ...serverCfg },
+      },
+    };
+  }
+
+  function makeCache(config: AdapterConfig): MetadataCache {
+    return {
+      version: 1,
+      servers: {
+        srv: {
+          configHash: computeServerHash(config.mcpServers.srv),
+          cachedAt: Date.now(),
+          tools: TOOLS,
+        },
+      },
+    };
+  }
+
+  it("缓存条目按 includeTools/excludeTools 过滤后输出", () => {
+    const config = makeConfig({
+      includeTools: ["sql_*"],
+      excludeTools: ["sql_insert"],
+    });
+    const result = getValidCachedServers(config, makeCache(config));
+    assert.deepEqual(
+      result.srv.tools.map((t) => t.name),
+      ["sql_query"],
+    );
+  });
+
+  it("无过滤配置时缓存工具原样输出", () => {
+    const config = makeConfig({});
+    const result = getValidCachedServers(config, makeCache(config));
+    assert.equal(result.srv.tools.length, TOOLS.length);
+  });
+
+  it("调整过滤配置不改变哈希指纹（不触发重新发现）", () => {
+    const before = computeServerHash(
+      makeConfig({ includeTools: ["sql_*"] }).mcpServers.srv,
+    );
+    const after = computeServerHash(
+      makeConfig({ includeTools: ["all_*"], excludeTools: ["x"] }).mcpServers
+        .srv,
+    );
+    assert.equal(before, after);
+  });
+
+  it("修改 command 仍会使哈希指纹变化", () => {
+    const before = computeServerHash(makeConfig({}).mcpServers.srv);
+    const after = computeServerHash({ type: "stdio", command: "python" });
+    assert.notEqual(before, after);
   });
 });
 
