@@ -369,12 +369,23 @@ npx -y @lancernix/mcp-adapter@latest import --client opencode --from ~/.config/o
 > * **Resources** 数量通常很少（每个服务 5-10 个），且一般通过 URI 直接引用，不依赖模糊搜索发现。
 
 ### 缓存哈希
-网关通过 **黑名单策略** 计算每个服务的配置指纹：排除 `aliases`、`lifecycle`、`disabled`、`idleTimeout`、`refreshOnStartup`、`connectTimeoutMs`、`requestTimeoutMs`、`closeTimeoutMs` 等 adapter 元数据字段，其余所有字段（`type`、`command`、`args`、`env`、`cwd`、`url`、`headers` 及未来新增字段）全部纳入 SHA256。配置不变则复用缓存，变更则自动重新发现。
+网关通过 **黑名单策略** 计算每个服务的配置指纹：排除 `aliases`、`lifecycle`、`disabled`、`idleTimeout`、`refreshOnStartup`、`connectTimeoutMs`、`requestTimeoutMs`、`closeTimeoutMs`、`includeTools`、`excludeTools` 等 adapter 元数据字段，其余所有字段（`type`、`command`、`args`、`env`、`cwd`、`url`、`headers` 及未来新增字段）全部纳入 SHA256。配置不变则复用缓存，变更则自动重新发现。
 
 ### 代码规范与自愈
 * 项目基于 TypeScript 编写。修改代码后，需执行 `npm run build` 生成生产 JavaScript。
 * 底层通信严格遵循官方标准 MCP 协议，支持 SDK 内置的 Stdio、Streamable HTTP、SSE 三种传输方式。认证信息可通过 `headers` 或 `env` 配置传入。
 * 代码使用 biome 作为 linter/formatter，TS 编译启用 `strict` 模式。已消除所有显式 `any` 和非空断言（类型断言均为具体类型，如 `as unknown as MetadataCache`，无 `as any`）。
+
+### 发版流程（维护者）
+本仓库采用**手动控制版本**：版本号的唯一来源是 `package.json` 的 `version` 字段，发版通过打 tag 触发，仅 push `master` 只会运行 CI（lint + build + 测试），不会发布。
+
+1. 更新 `package.json` 中的 `version`（遵循 semver）
+2. 合并代码到 `master`
+3. 打 tag 并推送：`git tag v<x.y.z> && git push origin v<x.y.z>`
+
+tag 推送后 CI 自动完成：校验 tag 与 `package.json` 版本一致（不一致直接拒绝发布）→ lint + build + 测试 → `npm publish`（走 npm Trusted Publishing / OIDC 认证，无需任何 token，自动附带 provenance）→ 自动创建 GitHub Release。
+
+前置条件（一次性）：在 npmjs.com 的包设置中配置 Trusted Publisher（Provider: GitHub Actions，Owner: `Lancernix`，Repository: `mcp-adapter`，Workflow: `main.yaml`，Environment: `release`）。CI 配置见 `.github/workflows/main.yaml`。
 
 ### 进程生命周期
 * 强烈建议在低配 VPS 上开启 `"lifecycle": "lazy"`。网关会在高频调用后进入闲置轮询，将进程优雅退温，宿主机将始终保持轻量健康的负载表现。
