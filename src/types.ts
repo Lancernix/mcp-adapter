@@ -48,6 +48,7 @@ export interface ConnectOptions {
   requestTimeoutMs?: number;
   closeTimeoutMs?: number;
   failureBackoffMs?: number; // 连接失败冷却窗口，由调用方从全局 settings 解析后传入
+  recordFailureBackoff?: boolean; // 默认 true；后台 bootstrap 等场景传 false，避免瞬时失败污染前台冷却窗口
 }
 
 export interface BootstrapStatus {

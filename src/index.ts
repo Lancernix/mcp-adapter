@@ -230,6 +230,9 @@ async function bootstrapServersSequentially(
           requestTimeoutMs: config.settings?.requestTimeoutMs,
           closeTimeoutMs: config.settings?.closeTimeoutMs,
           failureBackoffMs: config.settings?.failureBackoffMs,
+          // 后台 bootstrap 的瞬时失败（如 npx 冷启动下载慢）不记录冷却，
+          // 否则会把前台对该服务的 search/execute 拒之门外长达一个冷却窗口
+          recordFailureBackoff: false,
           closeIfCreated: true,
           forceRefresh: srvConfig.refreshOnStartup === true,
         },

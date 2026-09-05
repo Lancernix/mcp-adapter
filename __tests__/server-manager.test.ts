@@ -59,6 +59,30 @@ describe("McpServerManager 失败冷却", () => {
     }
   });
 
+  it("recordFailureBackoff=false 时失败不记录冷却（后台 bootstrap 场景）", async () => {
+    const manager = new McpServerManager();
+    const config = missingCommandConfig();
+
+    await assert.rejects(
+      () =>
+        manager.connect("bg-fail-srv", config, {
+          failureBackoffMs: 60_000,
+          recordFailureBackoff: false,
+        }),
+      /连接底层真实 MCP 服务/,
+    );
+
+    // 失败未被记入冷却：第二次尝试仍是真实连接错误，而不是冷却快速失败
+    await assert.rejects(
+      () =>
+        manager.connect("bg-fail-srv", config, { failureBackoffMs: 60_000 }),
+      (err: Error) => {
+        assert.doesNotMatch(err.message, /正在冷却/);
+        return true;
+      },
+    );
+  });
+
   it("不同 server 的冷却互相独立", async () => {
     const manager = new McpServerManager();
     const config = missingCommandConfig();

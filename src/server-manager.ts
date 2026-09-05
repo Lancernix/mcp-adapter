@@ -196,7 +196,9 @@ export class McpServerManager {
       };
     } catch (err) {
       this.pendingResources.delete(name);
-      this.failureBackoff.recordFailure(name);
+      if (options?.recordFailureBackoff !== false) {
+        this.failureBackoff.recordFailure(name);
+      }
 
       // 捕获异常，彻底释放句柄并关闭进程，防止泄漏僵尸
       const cleanupTimeoutMs =
@@ -396,6 +398,7 @@ export class McpServerManager {
       connectTimeoutMs?: number;
       closeTimeoutMs?: number;
       failureBackoffMs?: number;
+      recordFailureBackoff?: boolean;
       closeIfCreated?: boolean;
       forceRefresh?: boolean;
     },
@@ -426,6 +429,7 @@ export class McpServerManager {
       connectTimeoutMs?: number;
       closeTimeoutMs?: number;
       failureBackoffMs?: number;
+      recordFailureBackoff?: boolean;
       closeIfCreated?: boolean;
       forceRefresh?: boolean;
     },
@@ -446,6 +450,7 @@ export class McpServerManager {
       connectTimeoutMs: options?.connectTimeoutMs,
       closeTimeoutMs: options?.closeTimeoutMs,
       failureBackoffMs: options?.failureBackoffMs,
+      recordFailureBackoff: options?.recordFailureBackoff,
     });
 
     const conn = result.conn;
