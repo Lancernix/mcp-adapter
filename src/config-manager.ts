@@ -2,6 +2,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { z } from "zod";
 import { AdapterConfigSchema } from "./config-schema.js";
 import { normalizeForSearch } from "./search-utils.js";
@@ -71,6 +72,7 @@ export function ensureConfigFile(): void {
         connectTimeoutMs: 60000,
         requestTimeoutMs: 60000,
         closeTimeoutMs: 10000,
+        failureBackoffMs: 60000,
       },
       mcpServers: {},
     };
@@ -143,16 +145,27 @@ export function saveConfig(config: AdapterConfig): void {
 }
 
 /**
- * 构建子进程环境变量，过滤 process.env 中的 undefined 值
+ * 构建子进程环境变量，过滤 process.env 中的 undefined 值。
+ * inheritEnv 为 false 时不继承宿主进程的任意环境变量，仅保留 SDK 的跨平台
+ * 安全默认集（HOME/PATH 等）与显式配置的 env；注意这不是空环境，也不是 OS 沙箱。
  */
 export function buildChildEnv(
   extra?: Record<string, string>,
+  inheritEnv: boolean = true,
 ): Record<string, string> {
   const env: Record<string, string> = {};
 
-  for (const [key, value] of Object.entries(process.env)) {
-    if (value !== undefined) {
-      env[key] = value;
+  if (inheritEnv) {
+    for (const [key, value] of Object.entries(process.env)) {
+      if (value !== undefined) {
+        env[key] = value;
+      }
+    }
+  } else {
+    for (const [key, value] of Object.entries(getDefaultEnvironment())) {
+      if (value !== undefined) {
+        env[key] = value;
+      }
     }
   }
 

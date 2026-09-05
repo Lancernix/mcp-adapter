@@ -15,6 +15,10 @@ export const ServerConfigSchema = z
     idleTimeout: z.number().positive().optional(),
     disabled: z.boolean().optional(),
     refreshOnStartup: z.boolean().optional(),
+    inheritEnv: z.boolean().optional(),
+    bearerTokenEnv: z.string().min(1).optional(),
+    includeTools: z.array(z.string().min(1)).optional(),
+    excludeTools: z.array(z.string().min(1)).optional(),
     connectTimeoutMs: z.number().int().nonnegative().optional(),
     requestTimeoutMs: z.number().int().nonnegative().optional(),
     closeTimeoutMs: z.number().int().nonnegative().optional(),
@@ -64,6 +68,7 @@ const SettingsSchema = z
     connectTimeoutMs: z.number().int().nonnegative().optional(),
     requestTimeoutMs: z.number().int().nonnegative().optional(),
     closeTimeoutMs: z.number().int().nonnegative().optional(),
+    failureBackoffMs: z.number().int().nonnegative().optional(),
   })
   .passthrough();
 

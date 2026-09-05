@@ -257,6 +257,7 @@ npx -y @lancernix/mcp-adapter@latest import --client opencode --from ~/.config/o
 | `connectTimeoutMs` | `number` | `60000` | 连接底层 MCP 服务的超时时间（毫秒）。设为 `0` 表示禁用超时 |
 | `requestTimeoutMs` | `number` | `60000` | `listTools` / `callTool` 等请求的超时时间（毫秒）。设为 `0` 表示禁用超时 |
 | `closeTimeoutMs` | `number` | `10000` | 关闭底层连接的超时时间（毫秒）。设为 `0` 表示禁用超时（例外：进程退出清理为保证可靠退出，即使设为 `0` 也会按 10 秒执行） |
+| `failureBackoffMs` | `number` | `60000` | 服务连接失败后的冷却窗口（毫秒）。冷却期内再次调用会快速失败并提示剩余等待时间，避免反复付出完整的连接超时；连接成功后自动解除。设为 `0` 关闭冷却 |
 
 ### 服务专属 `mcpServers` 配置项
 除了标准的 `command`、`args`、`env`、`cwd` 字段，网关新增了如下扩展配置：
@@ -272,6 +273,10 @@ npx -y @lancernix/mcp-adapter@latest import --client opencode --from ~/.config/o
 * `aliases` (string[], 可选): 服务器别名。可定义该服务的中文别名（如 `["思源", "思源笔记"]`），`search_tools` 会将其无缝纳入权重检索中。
 * `disabled` (boolean, 可选): 设为 `true` 则会在模糊搜索及工具执行时临时屏蔽该服务（`search_tools` 不会列出其工具，`execute_tool` 会拒绝调用）。
 * `refreshOnStartup` (boolean, 可选): 设为 `true` 时，该 server 会在 adapter 每次启动后的后台 bootstrap 中强制刷新 metadata cache，跳过缓存有效性检查。推荐用于 HTTP/SSE 等在线服务或工具列表可能动态变化的服务。对 stdio 服务也生效，但会在每次启动后后台拉起对应子进程，请谨慎开启。
+* `inheritEnv` (boolean, 可选, 仅 stdio, 默认 `true`): 是否继承宿主进程的全部环境变量。设为 `false` 时，子进程仅保留 SDK 的跨平台安全默认集（如 `PATH`、`HOME`）与显式配置的 `env`，不携带宿主任意变量——适合多 agent 共享宿主机、或不想把本地凭证泄给底层服务的场景。注意这不是空环境，也不是 OS 沙箱。
+* `includeTools` (string[], 可选): 工具白名单。支持精确工具名或通配符（`sql_*`、`get?`），只有匹配的工具会被搜索、描述、列出和执行。
+* `excludeTools` (string[], 可选): 工具黑名单，在 `includeTools` 之后应用。被排除的工具不可发现也不可执行。适合在保留整个服务接入的同时隐藏用不到的工具（如管理类接口），进一步压缩搜索面。
+* `bearerTokenEnv` (string, 可选, 仅 http/sse): 从指定环境变量读取 token，连接时自动注入 `Authorization: Bearer <token>` 请求头，避免明文 token 写入 config.json。若 `headers` 中已显式配置 `Authorization` 则以显式配置为准；指定的环境变量缺失或为空时连接会报错。
 * `connectTimeoutMs` / `requestTimeoutMs` / `closeTimeoutMs` (number, 可选): 覆盖全局对应超时设置，单位为毫秒。适用于个别响应较慢的服务（如报表生成类工具）。
 
 ### aliases 最佳实践
