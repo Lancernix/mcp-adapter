@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import {
+  type CallToolResult,
+  ErrorCode,
+} from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import {
   filterServerTools,
@@ -25,6 +28,7 @@ import {
   loadConfig,
   resolveServerHint,
   resolveServerName,
+  takeConfigMigrationNotes,
 } from "./config-manager.js";
 import { McpLifecycleManager } from "./lifecycle.js";
 import { setConfigRef, writeLog } from "./logger.js";
@@ -97,6 +101,9 @@ async function initialize() {
   try {
     config = loadConfig();
     setConfigRef(() => config);
+    for (const note of takeConfigMigrationNotes()) {
+      writeLog(`[Config-Migration] ${note}\n`);
+    }
   } catch (err) {
     writeLog(
       `[Error] 无法启动网关，config.json 加载失败: ${err instanceof Error ? err.message : String(err)}\n`,
@@ -179,13 +186,44 @@ function getServersNeedingMetadataRefresh(): Array<[string, ServerConfig]> {
 function startBackgroundBootstrapIfNeeded(): void {
   if (bootstrapStarted) return;
 
-  const mode = config.settings?.metadataBootstrap ?? "background";
-  if (mode === "off") return;
+  const startupCheckEnabled = config.settings?.startupMetadataCheck ?? true;
+  const candidates = getServersNeedingMetadataRefresh();
+  const forcedServers = candidates.filter(
+    ([, cfg]) => cfg.refreshOnStartup === true,
+  );
 
-  const missingServers = getServersNeedingMetadataRefresh();
+  // startupMetadataCheck=false 只应关闭"按 TTL 兜底刷新"，不应连带吞掉显式的
+  // refreshOnStartup 声明。否则两个配置项组合时强制刷新会静默失效。
+  const missingServers = startupCheckEnabled ? candidates : forcedServers;
+
+  if (!startupCheckEnabled) {
+    writeLog(
+      "[Bootstrap] 已关闭启动期 metadata 体检（startupMetadataCheck: false）" +
+        (forcedServers.length > 0
+          ? `，仅刷新显式声明 refreshOnStartup 的 ${forcedServers.length} 个服务。\n`
+          : "，缓存将在按需检索发现失效时才刷新。\n"),
+    );
+  }
+
   if (missingServers.length === 0) {
-    writeLog("[Bootstrap] 所有服务 metadata 缓存均有效，无需后台刷新。\n");
+    if (startupCheckEnabled) {
+      writeLog(
+        "[Bootstrap] 全部服务 metadata 缓存有效，本次体检无需刷新任何服务。\n",
+      );
+    }
     return;
+  }
+
+  // 把"体检了谁、谁被强制重拉"打成一行，方便直接对照 config.json 排查
+  const pendingNames = missingServers.map(([name]) => name);
+  const forcedNames = forcedServers.map(([name]) => name);
+  writeLog(
+    `[Bootstrap] 启动期 metadata 体检开始：${pendingNames.length} 个服务待刷新 —— ${pendingNames.join(", ")}\n`,
+  );
+  if (forcedNames.length > 0) {
+    writeLog(
+      `[Bootstrap] 其中 ${forcedNames.length} 个服务声明了 refreshOnStartup，将跳过 configHash/TTL 检查、无条件重新拉取工具列表：${forcedNames.join(", ")}\n`,
+    );
   }
 
   bootstrapStarted = true;
@@ -196,6 +234,20 @@ function startBackgroundBootstrapIfNeeded(): void {
       bootstrapStatus.finishedAt = Date.now();
       writeLog(
         `[Bootstrap-Fatal] 后台 metadata 初始化异常中止: ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+    });
+  }, 0);
+}
+
+/**
+ * 后台预热 lifecycle=eager 的服务：主动建连，把冷启动延迟从"首次真实调用"
+ * 提前到"启动阶段"。与 metadata bootstrap 一样不阻塞网关就绪。
+ */
+function warmupEagerServersInBackground(): void {
+  setTimeout(() => {
+    lifecycleManager?.warmupEagerServers().catch((err) => {
+      writeLog(
+        `[Lifecycle-Warning] eager 预热流程异常: ${err instanceof Error ? err.message : String(err)}\n`,
       );
     });
   }, 0);
@@ -219,7 +271,13 @@ async function bootstrapServersSequentially(
     bootstrapStatus.current = name;
 
     try {
-      writeLog(`[Bootstrap] 正在刷新 [${name}]...\n`);
+      writeLog(
+        `[Bootstrap] 正在刷新 [${name}]（${
+          srvConfig.refreshOnStartup === true
+            ? "refreshOnStartup 强制重拉"
+            : "缓存缺失或已失效"
+        }）...\n`,
+      );
 
       const refreshed = await serverManager.refreshMetadataIfNeeded(
         name,
@@ -318,14 +376,30 @@ async function ensureServerMetadata(serverName: string): Promise<boolean> {
   if (!serverConfig || serverConfig.disabled) return false;
 
   try {
-    await serverManager.refreshMetadataIfNeeded(serverName, serverConfig, {
-      cacheTtlDays: config.settings?.cacheTtlDays,
-      connectTimeoutMs: config.settings?.connectTimeoutMs,
-      requestTimeoutMs: config.settings?.requestTimeoutMs,
-      closeTimeoutMs: config.settings?.closeTimeoutMs,
-      failureBackoffMs: config.settings?.failureBackoffMs,
-      closeIfCreated: true,
-    });
+    // 这是所有元工具（search / list / describe）刷新工具目录的唯一入口。
+    // refreshMetadataIfNeeded 内部先做有效性三校验（结构 / configHash / TTL），
+    // 缓存有效就返回 false —— 既不连子进程，也不写 cache.json。
+    const refreshed = await serverManager.refreshMetadataIfNeeded(
+      serverName,
+      serverConfig,
+      {
+        cacheTtlDays: config.settings?.cacheTtlDays,
+        connectTimeoutMs: config.settings?.connectTimeoutMs,
+        requestTimeoutMs: config.settings?.requestTimeoutMs,
+        closeTimeoutMs: config.settings?.closeTimeoutMs,
+        failureBackoffMs: config.settings?.failureBackoffMs,
+        closeIfCreated: true,
+      },
+    );
+
+    // 没有真的刷新，就什么都不用做：索引在启动时建过一次，之后每次真正刷新
+    // 都会跟着重建，此刻它一定是最新的。返回 true 的语义也对得上 ——
+    // refreshMetadataIfNeeded 只有在 isServerCacheValid 通过时才返回 false，
+    // 而上面已经排除了 disabled 的情况，所以该服务必然在有效缓存里。
+    //
+    // 这一步同时消除了并发放大：同一 server 的并发检索只会有一个真正执行刷新，
+    // 于是也只有一个会重建索引（metadataRefreshPromises 去重的是刷新，不是重建）。
+    if (!refreshed) return true;
 
     const refreshedCache = loadMetadataCache();
     const validCachedServers = getValidCachedServers(config, refreshedCache);
@@ -344,10 +418,33 @@ type ExecuteErrorType =
   | "tool_not_found"
   | "missing_param"
   | "type_error"
+  | "connection_lost"
   | "business";
+
+/** 提取错误对象上的机器可读错误码（McpError.code 或 Node 网络错误的 errno 字符串） */
+function errorCodeOf(err: unknown): string | number | undefined {
+  if (!err || typeof err !== "object") return undefined;
+  const code = (err as { code?: unknown }).code;
+  return typeof code === "string" || typeof code === "number"
+    ? code
+    : undefined;
+}
 
 function classifyError(err: Error): ExecuteErrorType {
   const msg = err.message.toLowerCase();
+
+  // 连接层错误优先判定：这类错误的引导文案和"业务失败"完全不同，
+  // 而且绝不能落到参数类错误分支上去。
+  //
+  // 判定以**错误码**为主而不是靠匹配错误文本：底层工具完全可能返回一句
+  // 带 "connection closed" 的业务错误（比如数据库连接池报错），
+  // 按文本匹配会把业务失败误判成网关侧断连，给出错误的处置建议。
+  const code = errorCodeOf(err);
+  if (code === ErrorCode.ConnectionClosed) return "connection_lost";
+  if (code === "ECONNRESET" || code === "EPIPE") return "connection_lost";
+  // SDK 在 transport 已释放时抛的是这个字面量错误，做全等匹配避免误伤业务文案
+  if (msg === "not connected") return "connection_lost";
+
   if (
     msg.includes("not found") ||
     msg.includes("unknown tool") ||
@@ -480,6 +577,10 @@ mcpServer.registerTool(
     let serverHintNote: string | undefined;
     let effectiveQuery = query;
     let lowCandidateRefreshFailed: string | undefined;
+    // 高置信 hint 的 metadata 刷新失败时置位：此时已为该服务付出过一次完整的
+    // 刷新尝试（可能耗满 connectTimeoutMs），后面的"从 query 识别服务"不应再
+    // 对同一个服务重复尝试，否则一次搜索可能要等两次连接超时
+    let hintRefreshFailed = false;
 
     if (targetServerInput) {
       const resolved = resolveServerHint(targetServerInput, config.mcpServers);
@@ -495,19 +596,20 @@ mcpServer.registerTool(
           };
         }
 
-        targetServer = resolved.resolvedServer;
-        const ok = await ensureServerMetadata(targetServer);
+        const hinted = resolved.resolvedServer;
+        const ok = await ensureServerMetadata(hinted);
         if (!ok) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `[mcp-adapter-ERROR] 已识别 server "${targetServer}"，但刷新 metadata 失败。请检查该 MCP 服务是否可启动、网络是否可达、认证信息是否正确。`,
-              },
-            ],
-          };
+          // 刷新失败不等于搜索失败：这个服务当前拉不起来，但其它服务可能就有
+          // 用户要的东西。直接报错会把整条工具链在这里断掉，什么都不给；
+          // 降级为全局搜索并把原因讲清楚，让调用方自己判断结果是否可用。
+          hintRefreshFailed = true;
+          serverHintNote =
+            `已识别 server "${hinted}"，但该服务当前无法访问（启动失败、网络不通或认证错误），已降级为全局搜索。` +
+            `如果你确实只想要该服务的结果，请先确认它能正常启动后再试。`;
+        } else {
+          targetServer = hinted;
+          serverHintNote = `服务提示 "${targetServerInput}" 已解析为 server "${targetServer}"，已在该服务范围内搜索。`;
         }
-        serverHintNote = `服务提示 "${targetServerInput}" 已解析为 server "${targetServer}"，已在该服务范围内搜索。`;
       } else {
         // 中低置信或无法匹配时，将 hint 拼回 query 作为搜索关键词
         effectiveQuery = `${targetServerInput} ${query}`;
@@ -534,7 +636,7 @@ mcpServer.registerTool(
     // query 命中唯一 alias 时同步刷新
     let inferredServer: string | undefined;
     let inferredServerMetadataOk: boolean | undefined;
-    if (!targetServer) {
+    if (!targetServer && !hintRefreshFailed) {
       const mentionedServers = findServersMentionedInQueryFromConfig(
         query,
         config.mcpServers,
@@ -616,11 +718,11 @@ mcpServer.registerTool(
       } else {
         const validCache = getValidCachedServers(config, loadMetadataCache());
         if (Object.keys(validCache).length === 0) {
-          const bootstrapMode =
-            config.settings?.metadataBootstrap ?? "background";
-          if (bootstrapMode === "off") {
+          const startupCheckEnabled =
+            config.settings?.startupMetadataCheck ?? true;
+          if (!startupCheckEnabled) {
             text +=
-              "\n\n当前 metadata cache 为空，且 metadataBootstrap=off。请使用带 server 参数的 search_tools、list_tools 或 describe_tool 手动触发对应服务的 metadata 刷新。";
+              "\n\n当前 metadata cache 为空，且已关闭启动期 metadata 体检（startupMetadataCheck: false）。请使用带 server 参数的 search_tools、list_tools 或 describe_tool 手动触发对应服务的 metadata 刷新。";
           } else {
             text +=
               "\n\n当前 metadata cache 为空。adapter 会在后台初始化，请稍后重试。";
@@ -952,7 +1054,7 @@ mcpServer.registerTool(
       );
     }
 
-    conn.inFlight++;
+    serverManager.retain(conn);
     const closeTimeoutMs =
       serverConfig.closeTimeoutMs ?? config.settings?.closeTimeoutMs ?? 10000;
 
@@ -994,20 +1096,29 @@ mcpServer.registerTool(
         case "type_error":
           userMsg = `[mcp-adapter] 调用 "${serverName}.${originalName}" 参数类型错误，请检查后重试。原始错误: ${rawMsg}`;
           break;
+        case "connection_lost":
+          // 网关不自动重试：无法判断这次调用是否已经在底层产生了副作用，
+          // 替模型重试可能让非幂等操作执行两次。是否重试交给发起方决定。
+          userMsg =
+            `[mcp-adapter] 与 [${serverName}] 的连接已断开（可能是子进程崩溃、被系统回收或网络中断），该连接已被回收。` +
+            `原始错误: ${rawMsg}。` +
+            `如果这次操作是幂等的（查询/读取类），直接重新调用一次即可，网关会自动冷启动新连接；` +
+            `如果可能已产生副作用（写入/提交/删除类），请先确认执行结果再决定是否重试。`;
+          break;
         default:
           userMsg = rawMsg;
       }
 
       throw new Error(userMsg);
     } finally {
-      conn.inFlight = Math.max(0, conn.inFlight - 1);
-      conn.lastUsedAt = Date.now();
-
       if (shouldDropConnection) {
-        await serverManager
-          .close(serverName, closeTimeoutMs, true)
-          .catch(() => {});
+        // 超时说明这条连接可能已经损坏：标记退役让它不再被复用，
+        // 但不在途请求结束前不做物理关闭。直接 force close 会让 SDK 把
+        // 同一 server 上所有 pending 请求一起 reject，误杀无关的并发调用。
+        serverManager.retire(serverName, conn);
       }
+
+      await serverManager.release(conn, closeTimeoutMs);
 
       writeLog(
         `[HitRate] ${serverName}.${originalName} | cache=${cacheHit ? "hit" : "miss"} | ${Date.now() - startTime}ms\n`,
@@ -1319,6 +1430,7 @@ async function main() {
   );
 
   startBackgroundBootstrapIfNeeded();
+  warmupEagerServersInBackground();
 }
 
 main().catch((err) => {

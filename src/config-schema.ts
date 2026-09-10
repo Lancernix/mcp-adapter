@@ -12,7 +12,7 @@ export const ServerConfigSchema = z
     headers: z.record(z.string(), z.string()).optional(),
     aliases: z.array(z.string()).optional(),
     lifecycle: z.enum(["lazy", "eager", "keep-alive"]).optional(),
-    idleTimeout: z.number().positive().optional(),
+    idleTimeout: z.number().nonnegative().optional(),
     disabled: z.boolean().optional(),
     refreshOnStartup: z.boolean().optional(),
     inheritEnv: z.boolean().optional(),
@@ -60,9 +60,16 @@ export const ServerConfigSchema = z
 
 const SettingsSchema = z
   .object({
-    idleTimeout: z.number().positive().optional(),
+    // 0 是合法值，语义为"禁用闲置回收"（见 lifecycle.ts 的短路判断）
+    idleTimeout: z.number().nonnegative().optional(),
     cacheTtlDays: z.number().nonnegative().optional(),
     toolSearchLimit: z.number().int().min(1).max(20).optional(),
+    startupMetadataCheck: z.boolean().optional(),
+    /**
+     * @deprecated 已更名为 startupMetadataCheck。
+     * 保留在 schema 里只为让旧配置的非法取值依然能报错；读取后由
+     * config-manager 的 migrateLegacySettings() 归一化并删除，写入从不使用。
+     */
     metadataBootstrap: z.enum(["background", "off"]).optional(),
     debug: z.boolean().optional(),
     connectTimeoutMs: z.number().int().nonnegative().optional(),

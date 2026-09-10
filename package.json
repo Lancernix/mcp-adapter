@@ -22,7 +22,7 @@
     "build": "tsc -p tsconfig.build.json",
     "watch": "tsc -w -p tsconfig.build.json",
     "start": "node dist/index.js",
-    "test": "tsx --test __tests__/*.test.ts",
+    "test": "tsx --test --test-timeout=120000 __tests__/*.test.ts",
     "format": "biome format --write .",
     "check": "biome check .",
     "prepack": "pnpm run build"
@@ -30,6 +30,7 @@
   "files": [
     "dist",
     "README.md",
+    "llm-install.md",
     "package.json"
   ],
   "license": "MIT",
