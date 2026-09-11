@@ -9,7 +9,7 @@
 //   FAKE_INIT_DELAY_MS  initialize 响应延迟，用于制造"建连中"状态
 //   FAKE_STUBBORN       1 = 忽略 stdin 关闭与 SIGTERM，只能被 SIGKILL 杀死
 //
-// 暴露的工具（与 meta-tools-e2e.test.ts 的 FAKE_TOOLS 常量保持同步）：
+// 暴露的工具（与 __tests__/e2e-harness.ts 的 FAKE_TOOLS 常量保持同步）：
 //   echo   { text }   立即回显 `echo:<text>`，用于验证结果原样透传
 //   sleep  { ms }     延迟 ms 后返回，用于制造慢请求与超时场景
 //   pid    {}         返回当前进程 pid，用于交叉验证连接复用

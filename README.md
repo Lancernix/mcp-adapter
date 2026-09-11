@@ -338,7 +338,14 @@ npm run build   # tsc 编译到 dist/
 
 | 文件 | 覆盖内容 |
 | :--- | :--- |
-| `__tests__/meta-tools-e2e.test.ts` | 4 个元工具的暴露面、冷启动写缓存、search 的各类命中与兜底、search→execute 闭环、list/describe、重名冲突、includeTools/excludeTools/disabled 的可见性与可执行性、`env`/`inheritEnv`/`cwd` 真实生效、eager 启动预热与无崩溃守护、缓存有效时不产生额外进程、关闭体检后的按需刷新、退出不留孤儿 |
+| `__tests__/meta-tools-main.e2e.test.ts` | 4 个元工具的暴露面、冷启动写缓存与启动日志、search 的各类命中与兜底、search→execute 闭环、list/describe、长文本原样透传、未知工具引导 |
+| `__tests__/meta-tools-filters.e2e.test.ts` | 重名冲突（describe 与 execute 双路径）、`includeTools`/`excludeTools` 的可见性与可执行性、disabled 完全隔离、关闭体检后的按需刷新 |
+| `__tests__/meta-tools-env-cwd.e2e.test.ts` | `env` / `inheritEnv` / `cwd` 是否真的作用到了子进程 |
+| `__tests__/meta-tools-eager.e2e.test.ts` | eager 启动预热、预热不写缓存、keep-alive 与 lazy 不预热、崩溃后无守护（不自动重启） |
+| `__tests__/meta-tools-degrade.e2e.test.ts` | server 提示指向不可用服务时降级为全局搜索、一次搜索内不对同一服务重复刷新 |
+| `__tests__/meta-tools-exit.e2e.test.ts` | 缓存有效时不产生额外进程、优雅退出不留孤儿、忽略 `SIGTERM` 的子进程仍被 `SIGKILL` 收敛 |
+
+> e2e 按关注点拆成多文件，是因为 `node:test` 以**文件**为单位并行调度：拆开后各文件独立进程并发跑，全量耗时从约 14s 降到约 6s。共享设施（`startAdapter` / `fakeServer` / `callTool` / `waitForCache`）集中在 `__tests__/e2e-harness.ts`（不以 `.test.ts` 结尾，不会被收集成用例）。
 
 **单元**（直接调用内部模块，验证并发、资源释放与缓存语义）：
 
@@ -360,7 +367,7 @@ npm run build   # tsc 编译到 dist/
 | `FAKE_INIT_DELAY_MS` | 延迟 `initialize` 响应，制造"建连中"状态 |
 | `FAKE_STUBBORN` | 设为 `1` 后忽略 stdin 关闭与 `SIGTERM`，只能被 `SIGKILL` 杀死 |
 
-暴露的工具（与 `meta-tools-e2e.test.ts` 的 `FAKE_TOOLS` 常量同步）：`echo` / `sleep` / `pid` / `crash`（直接 `process.exit(7)` 模拟崩溃）/ `env` / `cwd` / `fail`。
+暴露的工具（与 `__tests__/e2e-harness.ts` 的 `FAKE_TOOLS` 常量同步）：`echo` / `sleep` / `pid` / `crash`（直接 `process.exit(7)` 模拟崩溃）/ `env` / `cwd` / `fail`。
 
 > 改动 `src/server-manager.ts`、`src/lifecycle.ts` 或 4 个元工具的入口逻辑后，务必先确认 `npm test` 全绿再提交。
 
