@@ -9,11 +9,14 @@
 //   FAKE_INIT_DELAY_MS  initialize 响应延迟，用于制造"建连中"状态
 //   FAKE_STUBBORN       1 = 忽略 stdin 关闭与 SIGTERM，只能被 SIGKILL 杀死
 //
-// 暴露的工具：
-//   echo   { text }   立即回显
-//   sleep  { ms }     延迟 ms 后返回
-//   pid    {}         返回当前进程 pid
-//   crash  {}         立即 process.exit(7)（用来模拟子进程意外崩溃）
+// 暴露的工具（与 meta-tools-e2e.test.ts 的 FAKE_TOOLS 常量保持同步）：
+//   echo   { text }   立即回显 `echo:<text>`，用于验证结果原样透传
+//   sleep  { ms }     延迟 ms 后返回，用于制造慢请求与超时场景
+//   pid    {}         返回当前进程 pid，用于交叉验证连接复用
+//   crash  {}         立即 process.exit(7)（模拟子进程意外崩溃）
+//   env    { name }   回显本进程看到的环境变量，用于验证 env / inheritEnv
+//   cwd    {}         回显本进程工作目录，用于验证 cwd 配置
+//   fail   { message } 以非 -32000 的错误码返回业务失败，用于验证错误分类不误判
 
 import fs from "node:fs";
 import process from "node:process";

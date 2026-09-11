@@ -129,7 +129,10 @@ async function shutdownAndExit(reason: string) {
   if (shutdownInProgress) return;
   shutdownInProgress = true;
 
+  // stdin 的两个事件与两个信号都要摘掉：守卫能保证不重复执行，但监听器留着
+  // 会让 Node 保持事件循环存活，进程退出得更慢
   process.stdin.removeAllListeners("close");
+  process.stdin.removeAllListeners("end");
   process.removeAllListeners("SIGINT");
   process.removeAllListeners("SIGTERM");
 
@@ -144,9 +147,17 @@ async function shutdownAndExit(reason: string) {
 }
 
 function setupParentDeathWatch() {
-  process.stdin.on("close", () => {
+  // 宿主（Claude Code 等）正常退出时是**关闭 stdio 管道**，不发信号。
+  // 对端发来 FIN 后，process.stdin 先触发 "end"（流结束），流被销毁后再触发
+  // "close"。实测两者都会来，所以单监听 close 也能退出；这里两个都监听，
+  // 是为了让清理在 "end" 那一刻就启动、不必等到流销毁，同时防止将来某个
+  // Node 版本或 stdio 配置下 close 延迟/不来时彻底收不到退出信号。
+  // shutdownAndExit 有重入守卫，两个事件都到也只会执行一次。
+  const onParentGone = () => {
     void shutdownAndExit("检测到父进程管道已断开");
-  });
+  };
+  process.stdin.on("end", onParentGone);
+  process.stdin.on("close", onParentGone);
 
   process.on("SIGINT", () => {
     void shutdownAndExit("收到 SIGINT");

@@ -25,14 +25,15 @@ import {
   isAlive,
   mkdtempHome,
   readPids,
+  trackTmpDir,
   waitFor,
 } from "./helpers.js";
 
 // 隔离 metadata cache / logs 的落盘位置，避免污染开发者本机 ~/.mcp-adapter
 mkdtempHome("mcp-adapter-test-home-");
 
-const WORK_DIR = fs.mkdtempSync(
-  path.join(os.tmpdir(), "mcp-adapter-test-work-"),
+const WORK_DIR = trackTmpDir(
+  fs.mkdtempSync(path.join(os.tmpdir(), "mcp-adapter-test-work-")),
 );
 let logSeq = 0;
 
@@ -231,6 +232,9 @@ describe("进程管理 - 超时退役不误杀在途请求", () => {
 
     // A：500ms 的请求 + 100ms 超时预算 → 必然超时 → 触发退役
     const connA = await manager.connect("srv", config);
+    // bPromise 已在此前并发发起。若下面的断言先失败而 bPromise 从未被 await，
+    // 它会变成 unhandled rejection 盖掉真正的失败原因，所以先挂上兜底。
+    bPromise.catch(() => {});
     assert.equal(connA, warm, "A 复用的仍是同一条连接");
     await assert.rejects(
       () => callWithTimeout(manager, connA, "sleep", { ms: 500 }, 100),
@@ -436,6 +440,55 @@ describe("进程管理 - 闲置回收边界", () => {
     await manager.shutdownAll(2000, true);
   });
 
+  it("闲置超过 idleTimeout 的 lazy 连接会被真正回收，子进程一并退干净", async () => {
+    const spawnLog = newSpawnLog();
+    const manager = new McpServerManager();
+
+    // idleTimeout 的单位是分钟，0.001 分钟 = 60ms，用来把回收窗口压到可测范围
+    const la: AdapterConfig = {
+      version: 1,
+      settings: { idleTimeout: 10 },
+      mcpServers: {
+        "idle-srv": {
+          ...fakeConfig({ FAKE_SPAWN_LOG: spawnLog }),
+          lifecycle: "lazy",
+          idleTimeout: 0.001,
+        },
+      },
+    };
+
+    const lifecycle = new McpLifecycleManager(manager, la);
+    const conn = await manager.connect("idle-srv", la.mcpServers["idle-srv"]);
+    manager.retain(conn);
+    await manager.release(conn, 2000);
+
+    assert.equal(manager.isConnected("idle-srv"), true, "刚用完时应仍在池中");
+
+    await delay(200);
+    await lifecycle.sweepNow();
+
+    assert.equal(
+      manager.isConnected("idle-srv"),
+      false,
+      "闲置超时后 lazy 连接必须被 sweeper 回收",
+    );
+    assert.equal(
+      manager.inspect("idle-srv").retiredCount,
+      0,
+      "正常回收不应把连接丢进退役集合",
+    );
+
+    // 光看连接池不够：子进程也必须真的死了，否则物理内存并没有释放
+    const pid = readPids(spawnLog)[0];
+    assert.ok(pid > 0, "应当记录到子进程 pid");
+    assert.ok(
+      await waitFor(() => !isAlive(pid), 8000),
+      "被回收的连接对应的子进程必须退出",
+    );
+
+    await manager.shutdownAll(2000, true);
+  });
+
   it("isIdle 支持注入 now，且只对 connected 状态生效", async () => {
     const manager = new McpServerManager();
     const config = fakeConfig();
@@ -507,8 +560,12 @@ describe("进程管理 - 退出收敛", () => {
     const connectPromise = manager.connect("srv", config);
     connectPromise.catch(() => {});
 
-    await delay(100);
-    assert.equal(readPids(spawnLog).length, 1, "建连应已 spawn 出子进程");
+    // 必须轮询等待：子进程要完成 node 冷启动 + 写 spawn 记录，慢 CI 上可能远超
+    // 100ms。固定 delay 会把它变成一条偶发假红的用例。
+    assert.ok(
+      await waitFor(() => readPids(spawnLog).length === 1, 8000),
+      "建连应已 spawn 出子进程",
+    );
 
     await manager.shutdownAll(3000, true);
 

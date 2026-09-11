@@ -23,10 +23,12 @@ import type {
   ServerCacheEntry,
   ServerConfig,
 } from "../src/types.js";
+import { trackTmpDir } from "./helpers.js";
 
 function freshHome(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-adapter-cache-home-"));
   process.env.MCP_ADAPTER_HOME = dir;
+  trackTmpDir(dir);
   return dir;
 }
 
@@ -179,11 +181,11 @@ describe("metadata cache 落盘", () => {
     const home = freshHome();
     assert.equal(loadMetadataCache(), null, "文件不存在应返回 null");
 
-    fs.writeFileSync(getCachePath(home), "{ 不是合法 JSON", "utf-8");
+    fs.writeFileSync(getCachePath(), "{ 不是合法 JSON", "utf-8");
     assert.equal(loadMetadataCache(), null, "损坏的 JSON 应返回 null");
 
     fs.writeFileSync(
-      getCachePath(home),
+      getCachePath(),
       JSON.stringify({ version: 999, servers: {} }),
       "utf-8",
     );
@@ -261,7 +263,7 @@ describe("metadata cache 落盘", () => {
       servers: { alpha: entryFor(BASE_SERVER) },
     });
 
-    const mode = fs.statSync(getCachePath(home)).mode & 0o777;
+    const mode = fs.statSync(getCachePath()).mode & 0o777;
     assert.equal(mode, 0o600);
   });
 });
@@ -269,24 +271,80 @@ describe("metadata cache 落盘", () => {
 // ---- 进程内快照（mtime 短路）----
 
 describe("metadata cache 进程内快照", () => {
-  function write(dir: string, servers: Record<string, ServerCacheEntry>): void {
+  function write(servers: Record<string, ServerCacheEntry>): void {
     fs.writeFileSync(
-      getCachePath(dir),
+      getCachePath(),
       JSON.stringify({ version: 1, servers }, null, 2),
       "utf-8",
     );
   }
 
+  it("文件未变化时命中快照：返回同一引用，且不重复读盘", () => {
+    freshHome();
+    write({ alpha: entryFor(BASE_SERVER, { tools: [{ name: "t1" }] }) });
+
+    const first = loadMetadataCache();
+    assert.ok(first, "首次读取应成功");
+
+    // 打桩计数：命中快照时不应该再走 readFileSync
+    const realRead = fs.readFileSync;
+    let reads = 0;
+    (fs as unknown as { readFileSync: typeof realRead }).readFileSync = ((
+      ...args: Parameters<typeof realRead>
+    ) => {
+      reads += 1;
+      return realRead.apply(fs, args);
+    }) as typeof realRead;
+
+    let second: MetadataCache | null = null;
+    let third: MetadataCache | null = null;
+    try {
+      second = loadMetadataCache();
+      third = loadMetadataCache();
+    } finally {
+      (fs as unknown as { readFileSync: typeof realRead }).readFileSync =
+        realRead;
+    }
+
+    assert.equal(reads, 0, "命中快照时必须跳过读盘（这是该优化的全部价值）");
+    assert.equal(second, first, "命中快照应返回同一对象引用");
+    assert.equal(third, first);
+    assert.equal(second?.servers.alpha.tools[0].name, "t1");
+  });
+
+  it("只改 ctime 不影响快照命中（读取路径会 chmod 收紧权限）", () => {
+    freshHome();
+    write({ alpha: entryFor(BASE_SERVER, { tools: [{ name: "t1" }] }) });
+
+    const first = loadMetadataCache();
+    const beforeCtime = fs.statSync(getCachePath()).ctimeMs;
+
+    // chmod 只改 ctime，不动 mtime/size —— 读取路径每次都会 chmod 0600，
+    // 如果快照误用 ctime 做判据，这里会永远命中不了，优化等于失效
+    fs.chmodSync(getCachePath(), 0o600);
+    assert.notEqual(
+      fs.statSync(getCachePath()).ctimeMs,
+      beforeCtime,
+      "ctime 应当确实变化了，否则这条用例没有意义",
+    );
+
+    assert.equal(
+      loadMetadataCache(),
+      first,
+      "ctime 变化不应导致快照失效（mtime + size 才是判据）",
+    );
+  });
+
   it("外部进程改写 cache.json 后能读到新内容，不会返回过期快照", () => {
     const home = freshHome();
 
-    write(home, {
+    write({
       alpha: entryFor(BASE_SERVER, { tools: [{ name: "t1" }] }),
     });
     assert.equal(loadMetadataCache()?.servers.alpha.tools[0].name, "t1");
 
     // 模拟另一个 adapter 进程写入：条目不同、长度也不同
-    write(home, {
+    write({
       beta: entryFor(BASE_SERVER, { tools: [{ name: "t2" }, { name: "t3" }] }),
     });
 
@@ -320,12 +378,12 @@ describe("metadata cache 进程内快照", () => {
       "自己写完必须能立刻读到，不能命中写入前的快照",
     );
 
-    assert.ok(fs.existsSync(getCachePath(home)));
+    assert.ok(fs.existsSync(getCachePath()));
   });
 
   it("切换到另一个工作区时不会命中上一个工作区的快照", () => {
     const homeA = freshHome();
-    write(homeA, {
+    write({
       onlyInA: entryFor(BASE_SERVER, { tools: [{ name: "a" }] }),
     });
     assert.equal(loadMetadataCache()?.servers.onlyInA?.tools[0].name, "a");
@@ -337,7 +395,7 @@ describe("metadata cache 进程内快照", () => {
       "新工作区还没有 cache.json，不得返回上一个工作区的快照",
     );
 
-    write(homeB, {
+    write({
       onlyInB: entryFor(BASE_SERVER, { tools: [{ name: "b" }] }),
     });
     const inB = loadMetadataCache();
@@ -347,20 +405,20 @@ describe("metadata cache 进程内快照", () => {
 
   it("cache.json 被删除后返回 null，不会继续返回旧快照", () => {
     const home = freshHome();
-    write(home, { alpha: entryFor(BASE_SERVER) });
+    write({ alpha: entryFor(BASE_SERVER) });
     assert.ok(loadMetadataCache());
 
-    fs.unlinkSync(getCachePath(home));
+    fs.unlinkSync(getCachePath());
     assert.equal(loadMetadataCache(), null, "文件没了就不该再返回快照");
   });
 
   it("缓存内容损坏时返回 null，修好后能恢复读取", () => {
     const home = freshHome();
 
-    fs.writeFileSync(getCachePath(home), "{ 坏掉的 JSON", "utf-8");
+    fs.writeFileSync(getCachePath(), "{ 坏掉的 JSON", "utf-8");
     assert.equal(loadMetadataCache(), null);
 
-    write(home, { alpha: entryFor(BASE_SERVER) });
+    write({ alpha: entryFor(BASE_SERVER) });
     assert.deepEqual(Object.keys(loadMetadataCache()?.servers ?? {}), [
       "alpha",
     ]);

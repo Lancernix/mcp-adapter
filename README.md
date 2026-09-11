@@ -282,7 +282,7 @@ MCP 协议定义了三种能力，网关目前只拦截 Tools。原因很直接�
 网关不实时查询底层服务，而是把工具元数据缓存在 `cache.json`。缓存有效性由三条校验共同决定：
 
 1. **结构合法** —— 条目必须包含完整的指纹与工具列表
-2. **配置指纹匹配** —— 对服务的连接相关字段（`type`、`command`、`args`、`env`、`cwd`、`url`、`headers`）做 SHA256。`aliases`、`lifecycle`、`includeTools` 等 adapter 侧元数据不进指纹，改它们不会触发重新发现
+2. **配置指纹匹配** —— 对服务的 `ServerConfig` 做 SHA256，采用**黑名单策略**：除 `aliases`、`lifecycle`、`includeTools` 等 adapter 侧元数据外，其余字段全部进指纹。好处是以后新增连接相关字段会自动纳入，不需要维护白名单；改元数据类字段不会触发重新发现
 3. **未超期** —— 不超过 `cacheTtlDays`
 
 任一条不通过就在下次需要时重新拉取。这是个**最终一致**的设计：它能发现"配置变了"，但发现不了"服务内部工具变了而配置没动"——后者靠 TTL、`refreshOnStartup` 或手动删除缓存兜底。这样换来的是"每次搜索都不需要拉起子进程"。
@@ -360,7 +360,7 @@ npm run build   # tsc 编译到 dist/
 | `FAKE_INIT_DELAY_MS` | 延迟 `initialize` 响应，制造"建连中"状态 |
 | `FAKE_STUBBORN` | 设为 `1` 后忽略 stdin 关闭与 `SIGTERM`，只能被 `SIGKILL` 杀死 |
 
-暴露的工具：`echo` / `sleep` / `pid` / `crash`（直接 `process.exit(7)` 模拟崩溃）。
+暴露的工具（与 `meta-tools-e2e.test.ts` 的 `FAKE_TOOLS` 常量同步）：`echo` / `sleep` / `pid` / `crash`（直接 `process.exit(7)` 模拟崩溃）/ `env` / `cwd` / `fail`。
 
 > 改动 `src/server-manager.ts`、`src/lifecycle.ts` 或 4 个元工具的入口逻辑后，务必先确认 `npm test` 全绿再提交。
 

@@ -69,9 +69,33 @@ export function readPids(logPath: string): number[] {
     .filter((n) => Number.isFinite(n) && n > 0);
 }
 
-/** 创建一个临时目录并把 MCP_ADAPTER_HOME 指向它，用于隔离测试间的配置与缓存 */
+/**
+ * 创建一个临时目录并把 MCP_ADAPTER_HOME 指向它，用于隔离测试间的配置与缓存。
+ * 目录会登记在模块级的清理清单里，测试进程退出时统一删除——每次全量跑会在
+ * /tmp 留下十几个目录，靠系统清理既慢又不可控。
+ */
 export function mkdtempHome(prefix = "mcp-adapter-test-"): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   process.env.MCP_ADAPTER_HOME = dir;
+  tmpDirs.add(dir);
   return dir;
 }
+
+const tmpDirs = new Set<string>();
+
+/** 登记一个需要随测试进程退出的临时目录（自行 mkdtemp 的地方用它挂上清理） */
+export function trackTmpDir(dir: string): string {
+  tmpDirs.add(dir);
+  return dir;
+}
+
+process.on("exit", () => {
+  for (const dir of tmpDirs) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // 清理失败无所谓，不影响测试结果
+    }
+  }
+  tmpDirs.clear();
+});

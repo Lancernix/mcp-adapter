@@ -29,6 +29,7 @@ import {
   isAlive,
   ROOT,
   readPids,
+  trackTmpDir,
   waitFor,
 } from "./helpers.js";
 
@@ -76,7 +77,9 @@ async function startAdapter(
   configOrFactory: unknown | ((ctx: AdapterContext) => unknown),
   extraEnv: Record<string, string> = {},
 ): Promise<AdapterHandle> {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-adapter-e2e-"));
+  const home = trackTmpDir(
+    fs.mkdtempSync(path.join(os.tmpdir(), "mcp-adapter-e2e-")),
+  );
   const spawnLog = path.join(home, "spawn.log");
   const config =
     typeof configOrFactory === "function"
@@ -119,6 +122,55 @@ async function startAdapter(
   await client.connect(transport);
   const adapterPid = transport.pid;
 
+  /**
+   * 关掉 adapter 的 stdin，等它自己走完 shutdownAndExit 退出。
+   *
+   * 不能用 SDK 的 `client.close()`：它会先 stdin.end()，2 秒后 SIGTERM，
+   * 再 2 秒后 SIGKILL adapter 进程。而 adapter 关闭顽固子进程同样需要约 4 秒
+   * 的升级链，两边时间几乎完全重合——adapter 会在发出 SIGKILL 之前被测试
+   * 强杀，于是"退出不留孤儿"这类断言是靠测试自己杀进程通过的，把
+   * shutdownAll 整个删掉它照样绿。
+   *
+   * 真实宿主（Claude Code 等）正常退出时也是关闭管道而非发信号，所以这里
+   * 模拟的才是真实路径。StdioClientTransport 没有暴露 stdin getter，只能取
+   * 底层子进程句柄；拿不到就退回发 SIGTERM，两条路径最终都汇到
+   * shutdownAndExit。最后再兜底 SIGKILL，避免 adapter 不响应时把测试挂住。
+   */
+  const shutdownAdapterGracefully = async () => {
+    if (!adapterPid) return;
+
+    const childStdin = (
+      transport as unknown as {
+        _process?: { stdin?: { end: () => void; destroyed?: boolean } };
+      }
+    )._process?.stdin;
+
+    if (childStdin && !childStdin.destroyed) {
+      try {
+        childStdin.end();
+      } catch {
+        // 管道可能已经关闭，忽略
+      }
+    }
+
+    if (await waitFor(() => !isAlive(adapterPid), 15000, 50)) return;
+
+    // 没响应：退回信号，最后强杀。走到这一步说明退出路径有问题，
+    // 但至少不能让整个测试进程挂死在这里而无法报告失败。
+    try {
+      process.kill(adapterPid, "SIGTERM");
+    } catch {
+      return;
+    }
+    if (await waitFor(() => !isAlive(adapterPid), 5000, 50)) return;
+    try {
+      process.kill(adapterPid, "SIGKILL");
+    } catch {
+      // 已经退出
+    }
+    await waitFor(() => !isAlive(adapterPid), 3000, 50);
+  };
+
   const handle: AdapterHandle = {
     client,
     home,
@@ -126,8 +178,7 @@ async function startAdapter(
     logs: () => chunks.join(""),
     stop: async () => {
       runningAdapters.delete(handle);
-      await client.close().catch(() => {});
-      if (adapterPid) await waitFor(() => !isAlive(adapterPid), 8000, 50);
+      await shutdownAdapterGracefully();
     },
   };
 
@@ -163,6 +214,18 @@ async function callTool(
   args: Record<string, unknown>,
 ): Promise<ToolResultLike> {
   return (await client.callTool({ name, arguments: args })) as ToolResultLike;
+}
+
+/**
+ * 从搜索结果里数出实际返回的工具条数。
+ * 命中路径的分组标题形如 `### demo (3 matches)`，
+ * 服务浏览兜底路径形如 `### demo (3 tools)`，两种都要统计。
+ */
+function countMatches(text: string): number {
+  return [...text.matchAll(/\((\d+) (?:matches|tools)\)/g)].reduce(
+    (sum, m) => sum + Number(m[1]),
+    0,
+  );
 }
 
 /** 等待启动期体检把指定 server 的工具写进 cache.json */
@@ -297,13 +360,29 @@ describe("元工具主链路 (e2e)", () => {
   });
 
   it("search_tools 支持 limit 控制返回数量", async () => {
-    const result = await callTool(adapter.client, "search_tools", {
-      query: "a",
-      limit: 1,
-    });
-    // 不断言具体条数（取决于打分），只要求请求被正常受理而不是参数报错
-    assert.equal(result.isError, undefined);
-    assert.ok(textOf(result).length > 0);
+    // 用一个必然匹配不到功能词的 query，走"已识别 server 但无强匹配"的浏览兜底：
+    // 该路径会返回该服务的全部工具，条数只受 limit 约束，断言可以做到精确。
+    const browseWithLimit = async (limit: number) => {
+      const result = await callTool(adapter.client, "search_tools", {
+        query: "zzz-这个关键词一定匹配不到任何工具",
+        server: "demo",
+        limit,
+      });
+      assert.equal(result.isError, undefined, "limit 应当被正常受理");
+      return countMatches(textOf(result));
+    };
+
+    const one = await browseWithLimit(1);
+    const three = await browseWithLimit(3);
+
+    assert.equal(one, 1, `limit=1 应只返回 1 条，实际 ${one} 条`);
+    assert.equal(three, 3, `limit=3 应返回 3 条，实际 ${three} 条`);
+
+    // 兜底路径最多只能给出该服务的全部工具数，limit 再大也不会超
+    assert.ok(
+      three <= FAKE_TOOLS.length,
+      `返回条数不应超过服务实际工具数（${FAKE_TOOLS.length}）`,
+    );
   });
 
   it("list_tools 返回工具名目录，且刻意不带 schema", async () => {
@@ -370,12 +449,30 @@ describe("元工具主链路 (e2e)", () => {
     assert.match(textOf(result), /search_tools/);
   });
 
-  it("execute_tool 把底层返回的原始结果原样透传（含长文本/结构化内容）", async () => {
+  it("execute_tool 把底层返回的原始结果原样透传（长文本不截断、特殊字符不转义）", async () => {
+    // 刻意构造长文本 + 需要转义的字符：验证网关没有做任何加工
+    const payload = [
+      "中文内容",
+      "换行\n第二行",
+      '引号"与反斜杠\\',
+      "x".repeat(5000),
+    ].join("|");
+
     const result = await callTool(adapter.client, "execute_tool", {
-      tool: "demo.sleep",
-      arguments: { ms: 1 },
+      tool: "demo.echo",
+      arguments: { text: payload },
     });
-    assert.equal(textOf(result), "slept:1");
+
+    assert.equal(result.isError, undefined);
+    const text = textOf(result);
+    assert.equal(
+      text.length,
+      payload.length + "echo:".length,
+      `长文本必须原样透传：期望 ${payload.length + 5} 字符，实际 ${text.length}`,
+    );
+    assert.ok(text.includes("x".repeat(5000)), "长文本不得被截断");
+    assert.ok(text.includes("换行\n第二行"), "换行符不得被转义或吞掉");
+    assert.ok(text.includes('引号"与反斜杠\\'), "引号与反斜杠不得被转义");
   });
 
   it("底层工具的业务失败不会被误判成网关断连", async () => {
@@ -661,7 +758,7 @@ describe("元工具 - env / inheritEnv / cwd (e2e)", () => {
 
   before(async () => {
     cwdTarget = fs.realpathSync(
-      fs.mkdtempSync(path.join(os.tmpdir(), "mcp-adapter-cwd-")),
+      trackTmpDir(fs.mkdtempSync(path.join(os.tmpdir(), "mcp-adapter-cwd-"))),
     );
 
     adapter = await startAdapter(
@@ -885,12 +982,12 @@ describe("元工具 - server 提示指向不可用服务时降级为全局搜索
       version: 1,
       settings: { startupMetadataCheck: true },
       mcpServers: {
-        // 命令不存在：metadata 刷新必然失败
-        broken: {
-          type: "stdio",
-          command: "mcp-adapter-missing-command",
-          args: [],
-        },
+        // initialize 被延迟 3s，而建连超时只有 800ms → 刷新必然失败，
+        // 且每次失败都要实打实等满 800ms。这样"刷了几次"可以用耗时区分。
+        broken: fakeServer({
+          env: { FAKE_INIT_DELAY_MS: "3000" },
+          connectTimeoutMs: 800,
+        }),
         ok: fakeServer({ aliases: ["可用服务"] }),
       },
     });
@@ -921,15 +1018,27 @@ describe("元工具 - server 提示指向不可用服务时降级为全局搜索
   });
 
   it("降级后不会对同一个服务反复尝试刷新（避免一次搜索等两次连接超时）", async () => {
-    // 只断言行为结果：即便 query 里再次提到 broken，也不会把搜索拖死。
-    // 这里用一次带提示的调用计时，超时由外层 --test-timeout 兜底。
+    // query 里再次提到 broken 时，若没有去重就会再刷一次、再等满一个 800ms 超时。
+    // 预热一次，让后续的计时不被首次启动开销污染。
+    await callTool(adapter.client, "search_tools", {
+      query: "echo",
+      server: "broken",
+    });
+
+    const startedAt = Date.now();
     const result = await callTool(adapter.client, "search_tools", {
       query: "用 broken 查一下 echo",
       server: "broken",
     });
+    const elapsed = Date.now() - startedAt;
+
     assert.equal(result.isError, undefined);
     assert.match(textOf(result), /已降级为全局搜索/);
     assert.match(textOf(result), /ok\.echo/);
+    assert.ok(
+      elapsed < 1400,
+      `一次搜索里同一服务只应尝试刷新一次，实际耗时 ${elapsed}ms（两次 800ms 超时约 1600ms+）`,
+    );
   });
 
   it("服务可用时仍然按提示窄化搜索，降级逻辑不影响正常路径", async () => {
@@ -1035,6 +1144,50 @@ describe("元工具 - 优雅退出与子进程回收 (e2e)", () => {
     assert.ok(
       allGone,
       `adapter 退出后不得留下孤儿子进程，残留 pid：${childPids.filter(isAlive).join(", ")}`,
+    );
+  });
+});
+
+// ---- 顽固子进程的退出收敛 ----
+
+describe("元工具 - 忽略 SIGTERM 的子进程仍被收敛 (e2e)", () => {
+  it("退出时走完 SIGTERM→SIGKILL 升级链，不会在 SIGKILL 之前放弃", async () => {
+    const adapter = await startAdapter({
+      version: 1,
+      settings: { startupMetadataCheck: false },
+      mcpServers: {
+        // 忽略 stdin 关闭与 SIGTERM，只有 SIGKILL 能杀死它。
+        // 这条用例的意义：普通子进程即便网关什么都不做，也会因 stdin EOF 而自行
+        // 退出，所以"退出不留孤儿"断言是**不可失败**的（把 shutdownAll 删掉照样绿）。
+        // 顽固进程让 shutdownAll 的关闭预算与升级链在端到端层面真正可证伪。
+        stubborn: fakeServer({
+          env: { FAKE_STUBBORN: "1" },
+          lifecycle: "keep-alive",
+        }),
+      },
+    });
+
+    const executed = await callTool(adapter.client, "execute_tool", {
+      tool: "stubborn.pid",
+    });
+    assert.match(textOf(executed), /^pid:\d+$/);
+
+    const pid = adapter.spawnedPids().at(-1);
+    assert.ok(pid && isAlive(pid), "顽固子进程应当已被拉起且存活");
+
+    const startedAt = Date.now();
+    await adapter.stop();
+    const elapsed = Date.now() - startedAt;
+
+    // SDK 的关闭升级链是 stdin.end → 2s → SIGTERM → 2s → SIGKILL，约 4s。
+    // 若关闭预算被压到这条链之下，Shutdown 会在 SIGKILL 发出前就放弃 → 留孤儿。
+    assert.ok(
+      elapsed >= 3500,
+      `必须等升级链走完再退出，实际仅 ${elapsed}ms（约 4s 才到 SIGKILL）`,
+    );
+    assert.ok(
+      await waitFor(() => !isAlive(pid), 5000),
+      "顽固子进程最终必须被 SIGKILL 杀死",
     );
   });
 });
