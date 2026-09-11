@@ -976,20 +976,31 @@ describe("元工具 - eager 预热与 keep-alive (e2e)", () => {
 
 describe("元工具 - server 提示指向不可用服务时降级为全局搜索 (e2e)", () => {
   let adapter: AdapterHandle;
+  /** broken 独占的 spawn 记录：每次刷新尝试必然拉起一个子进程，用它数"刷了几次" */
+  let brokenSpawnLog = "";
 
   before(async () => {
-    adapter = await startAdapter({
-      version: 1,
-      settings: { startupMetadataCheck: true },
-      mcpServers: {
-        // initialize 被延迟 3s，而建连超时只有 800ms → 刷新必然失败，
-        // 且每次失败都要实打实等满 800ms。这样"刷了几次"可以用耗时区分。
-        broken: fakeServer({
-          env: { FAKE_INIT_DELAY_MS: "3000" },
-          connectTimeoutMs: 800,
-        }),
-        ok: fakeServer({ aliases: ["可用服务"] }),
-      },
+    adapter = await startAdapter((ctx) => {
+      brokenSpawnLog = path.join(ctx.home, "broken-spawn.log");
+      return {
+        version: 1,
+        // failureBackoffMs 必须显式关掉：默认 60s 冷却会把失败后的再次刷新变成
+        // 0ms 快速失败，下方"不重复刷新"用例将因此失去判别力——即使去掉去重
+        // 逻辑，第二次尝试也会被冷却瞬间弹回，次数和耗时都看不出差别。
+        settings: { startupMetadataCheck: true, failureBackoffMs: 0 },
+        mcpServers: {
+          // initialize 被延迟 3s，而建连超时只有 800ms → 刷新必然失败，
+          // 且每次失败都要实打实等满 800ms
+          broken: fakeServer({
+            env: {
+              FAKE_INIT_DELAY_MS: "3000",
+              FAKE_SPAWN_LOG: brokenSpawnLog,
+            },
+            connectTimeoutMs: 800,
+          }),
+          ok: fakeServer({ aliases: ["可用服务"] }),
+        },
+      };
     });
     await waitForCache(adapter.home, ["ok"]);
   });
@@ -1025,20 +1036,33 @@ describe("元工具 - server 提示指向不可用服务时降级为全局搜索
       server: "broken",
     });
 
+    // 主判据用 spawn 计数而不是耗时：每次刷新尝试必然拉起一个子进程，
+    // 去不掉就是 2 次、去重生效就是 1 次，与机器快慢无关。
+    const spawnsBefore = readPids(brokenSpawnLog).length;
     const startedAt = Date.now();
     const result = await callTool(adapter.client, "search_tools", {
       query: "用 broken 查一下 echo",
       server: "broken",
     });
     const elapsed = Date.now() - startedAt;
+    const spawned = readPids(brokenSpawnLog).length - spawnsBefore;
 
+    // 顺序有意为之：spawn 计数与耗时是"刷了几次"的直接证据，放在行为断言
+    // 之前。否则去掉去重逻辑时，会先在"搜索结果里没有 ok.echo"这里红掉，
+    // 看起来像是行为回归，真正的回归点（多刷了一次）反而没被指出来。
     assert.equal(result.isError, undefined);
-    assert.match(textOf(result), /已降级为全局搜索/);
-    assert.match(textOf(result), /ok\.echo/);
+    assert.equal(
+      spawned,
+      1,
+      `一次搜索里同一服务只应尝试刷新一次，实际拉起了 ${spawned} 个子进程`,
+    );
+    // 耗时是辅助判据：两次 800ms 超时约 1600ms+，只刷一次应明显低于它
     assert.ok(
       elapsed < 1400,
-      `一次搜索里同一服务只应尝试刷新一次，实际耗时 ${elapsed}ms（两次 800ms 超时约 1600ms+）`,
+      `一次搜索里同一服务只应尝试刷新一次，实际耗时 ${elapsed}ms`,
     );
+    assert.match(textOf(result), /已降级为全局搜索/);
+    assert.match(textOf(result), /ok\.echo/);
   });
 
   it("服务可用时仍然按提示窄化搜索，降级逻辑不影响正常路径", async () => {

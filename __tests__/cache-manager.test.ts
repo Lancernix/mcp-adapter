@@ -178,7 +178,7 @@ describe("isServerCacheValid", () => {
 
 describe("metadata cache 落盘", () => {
   it("loadMetadataCache 在文件缺失、损坏、版本不符时返回 null", () => {
-    const home = freshHome();
+    freshHome();
     assert.equal(loadMetadataCache(), null, "文件不存在应返回 null");
 
     fs.writeFileSync(getCachePath(), "{ 不是合法 JSON", "utf-8");
@@ -257,7 +257,7 @@ describe("metadata cache 落盘", () => {
   });
 
   it("缓存文件权限被收紧为 0600", async () => {
-    const home = freshHome();
+    freshHome();
     await saveMetadataCache({
       version: 1,
       servers: { alpha: entryFor(BASE_SERVER) },
@@ -336,7 +336,7 @@ describe("metadata cache 进程内快照", () => {
   });
 
   it("外部进程改写 cache.json 后能读到新内容，不会返回过期快照", () => {
-    const home = freshHome();
+    freshHome();
 
     write({
       alpha: entryFor(BASE_SERVER, { tools: [{ name: "t1" }] }),
@@ -358,7 +358,7 @@ describe("metadata cache 进程内快照", () => {
   });
 
   it("本进程写入后立即可见（写入会让快照失效）", async () => {
-    const home = freshHome();
+    freshHome();
 
     await saveMetadataCache({
       version: 1,
@@ -382,13 +382,13 @@ describe("metadata cache 进程内快照", () => {
   });
 
   it("切换到另一个工作区时不会命中上一个工作区的快照", () => {
-    const homeA = freshHome();
+    freshHome();
     write({
       onlyInA: entryFor(BASE_SERVER, { tools: [{ name: "a" }] }),
     });
     assert.equal(loadMetadataCache()?.servers.onlyInA?.tools[0].name, "a");
 
-    const homeB = freshHome();
+    freshHome();
     assert.equal(
       loadMetadataCache(),
       null,
@@ -404,7 +404,7 @@ describe("metadata cache 进程内快照", () => {
   });
 
   it("cache.json 被删除后返回 null，不会继续返回旧快照", () => {
-    const home = freshHome();
+    freshHome();
     write({ alpha: entryFor(BASE_SERVER) });
     assert.ok(loadMetadataCache());
 
@@ -413,7 +413,7 @@ describe("metadata cache 进程内快照", () => {
   });
 
   it("缓存内容损坏时返回 null，修好后能恢复读取", () => {
-    const home = freshHome();
+    freshHome();
 
     fs.writeFileSync(getCachePath(), "{ 坏掉的 JSON", "utf-8");
     assert.equal(loadMetadataCache(), null);
