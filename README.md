@@ -1,113 +1,72 @@
 # @lancernix/mcp-adapter
 
-一款专为海量工具场景（如数十个底座服务、数百个原子工具）打造的**标准通用 MCP 惰性分发网关**。
+把几十个 MCP 服务、几百个工具，收敛成 **4 个元工具**。
 
-在重度 AI 编码或智能体协同场景中，注册过多的 MCP 服务常会面临以下致命痛点：
-1. **Context 迅速暴涨：** 数十个 MCP 服务对应的数百个工具 Schema 统统塞入 System Prompt，每次对话前置开销可能高达数万 Token。
-2. **冷启动极慢且极耗内存：** 每次 AI 客户端（如 Claude Code CLI）冷启动时，会瞬间并发拉起几十个物理子进程，内存开销数以 GB 计。在 2GB RAM 等低配云主机上会导致卡死或进程被 OOM 强杀。
-
-`@lancernix/mcp-adapter` 采用 **“元工具拦截 + JIT 惰性唤醒 + 自消退释放 + 有序退出清理”** 的四重机制，解决上述痛点。
-
-> 关于第 4 点需要说明边界：有序退出清理覆盖的是有退出信号的场景（终端关闭、`Ctrl+C`、客户端正常退出）。`kill -9`、OOM 这类强制终止下，adapter 自身随客户端一起被杀，来不及执行清理，底层子进程仍会成为孤儿进程——这是子进程模型的结构性限制，不由网关决定。长运行内存控制的真正主力是 idle sweeper。
+mcp-adapter 是一个本地 MCP 网关。它挡在你的 AI 客户端和所有真实 MCP 服务之间，让客户端只需要认识 4 个元工具，剩下的工具发现与调度交给网关在幕后完成。
 
 ---
 
-## 核心特性
+## 它解决什么问题
 
-- 🛡️ **Context Token 挽救：** 物理拦截真实 Tools 的入参 Schema。网关对外**仅暴露 4 个元工具**（`search_tools`, `list_tools`, `describe_tool`, `execute_tool`），将大模型 System Prompt 阶段的工具提示词开销骤降 **95% 以上**（按数十服务、数百工具的典型场景估算，实际取决于底层工具数量与 Schema 复杂度）。其中 `search_tools` 返回完整 `inputSchema`，通常可直接进入 `execute_tool`；`list_tools` 提供轻量全量工具名目录作为兜底。
-- ⚡ **冷启动与惰性 JIT 唤醒 (Lazy Loading)：** 当 metadata cache 有效时，adapter 启动不会唤醒任何底层 MCP server。首次 cache 为空或部分失效时，adapter 会先接入客户端，再在后台顺序刷新缺失 metadata；每个 server 刷新完成后，若连接由 metadata refresh 临时创建则立即关闭；若该连接正在被其他请求复用则不会误关，后续交由 idle sweeper 自动释放。
-- ⏳ **闲置消退与自动降温 (Idle Autorelease)：** 内置 30s 扫描周期的 Sweeper。当底层服务闲置超过指定阈值（默认全局 10 分钟，支持单服务自定义）时，平滑杀死底层子进程并断开连接，彻底释放物理内存。
-- 🧹 **有序退出清理 (Graceful Shutdown)：** 监听父进程 `stdin` 的 `close` 事件与常规终止信号（`SIGINT`/`SIGTERM`），触发后统一走 `shutdownAndExit`：移除监听器并加 once guard 防重入 → 停止 sweeper → 按「半吊子资源 → pending 连接 → 存量连接」顺序清理 → `process.exit(0)`。覆盖终端关闭、`Ctrl+C`、客户端正常退出等有退出信号的场景；不适用于 `kill -9` / OOM 等强制终止。
-- 🔍 **混合工具搜索（BM25 + Fuse.js Token Search + IDF Rerank）：** 搜索层结合轻量 BM25 关键词召回、Fuse.js Token Search 多词模糊匹配，以及 IDF 加权字段命中重排。支持中英混合、中文服务别名、typo、多词乱序搜索。自动降低 `get`/`list`/`search`/`query` 等泛词影响，优先提升工具名、服务别名、稀有关键词的权重。Fuse Token Search 支持 `tokenMatch: "any"` 以保留部分 token 命中的召回能力，中文搜索通过 `Intl.Segmenter` 与 bigram 兜底增强。搜索结果通过 `matchReasons` 输出匹配依据和置信度，帮助模型判断是否可直接执行或需要先 `describe_tool`。
-- 📦 **AI 客户端配置导入 (CLI Config Migration)：** 支持 Claude Code 与 OpenCode 配置导入。`mcp-adapter import --client <name> --from <path>` 会解析客户端原生 MCP 配置，生成 adapter 自身的 `config.json`，并可在显式 `--write-client-config` 时把客户端 MCP 区域替换为单个 `mcp-adapter` 入口。导入会自动补充基础 aliases，并在生成的客户端入口中显式写入 `MCP_ADAPTER_HOME`，避免多 agent 共用配置/缓存互相污染。
+**问题一：上下文被工具 Schema 吃光。** MCP 的工作方式是客户端启动时把所有服务的所有工具定义（名称、描述、完整入参 JSON Schema）一次性塞进 System Prompt。服务一多，这部分固定开销就会涨到几万 token，每一轮对话都在为它买单——哪怕这次对话一个工具都用不上。
+
+**问题二：冷启动又慢又吃内存。** 客户端启动时会并发拉起每个 stdio 服务对应的子进程。几十个服务同时起来，在 2GB 内存的小机器上很容易卡死或被 OOM 杀掉。
+
+**实际效果。** 在一个真实配置（7 个 MCP 服务 / 410 个工具）上测量：
+
+| 指标 | 直连 | 经 mcp-adapter | 变化 |
+| :--- | :--- | :--- | :--- |
+| 初始上下文 token | ≈ 98.7k | ≈ 20.8k | **约 -79%** |
+| 启动时拉起的本地子进程 | 每个 stdio 服务一个 | 0（惰性唤醒） | 首次真实调用时才拉起 |
+
+压缩幅度随服务与工具数量增长而放大：服务越多、Schema 越复杂，省得越多。20.8k 这个数字主要来自 4 个元工具自身的固定开销和少量补充信息，不再随底层工具数量线性膨胀。
+
+> 关于"内存"：mcp-adapter 不优化单个底层服务自身的内存占用。它省的是**「每个 AI 客户端都要常驻一整套完整 stdio 服务集合」**这件事——服务只在真正被调用的那一刻才启动，闲置后自动退出。
 
 ---
 
-## 系统架构与实现逻辑
-
-网关作为 AI 客户端（如 Claude Code、Claude Desktop）与底层海量真实 MCP Server 之间的中间层，其运作模型如下：
+## 怎么工作（30 秒版）
 
 ```
-                    ┌────────────────────────┐
-                    │ AI Client (Claude CLI) │
-                    └───────────┬────────────┘
-                                │ StdIO 通道
-                                ▼
-         ┌──────────────────────────────────────────────┐
-         │            @lancernix/mcp-adapter            │
-         │  (仅暴露 4 个元工具，物理拦截真实 Schema)   │
-         └──────┬───────────────────────┬───────────────┘
-                │                       │
-                ├─ (1) search_tools     ├─ (2) list_tools
-                │  智能搜索，返回完整    │  浏览指定 server 的
-                │  inputSchema           │  全部工具名
-                │                       │
-                ▼                       ▼
-         ┌──────────────────────────────────────────────┐
-         │  (3) describe_tool        (4) execute_tool   │
-         │  查询单个工具完整 Schema   惰性唤醒并执行     │
-         └──────┬───────────────────────┬───────────────┘
-                │                       │
-                ▼                       ▼
-        ┌───────────────┐       ┌───────────────┐
-        │  MCP Server A │       │  MCP Server B │
-        └───────────────┘       └───────────────┘
+        AI 客户端
+            │ 只看到 4 个元工具
+            ▼
+   ┌─────────────────────┐
+   │    mcp-adapter      │   ← 工具目录（缓存）+ 按需调度
+   └──────┬──────────────┘
+          │ 用到哪个才拉起哪个
+          ▼
+   MCP Server A / B / C ...
 ```
 
-### 文件系统布局
+对外只暴露 4 个元工具：
 
-网关默认会将配置、缓存和日志保存在当前用户的家目录。单客户端默认使用 `~/.mcp-adapter/`；多 agent 并存时建议每个客户端使用独立工作区，例如 OpenCode 使用 `~/.mcp-adapter-opencode/`。
+| 元工具 | 一句话作用 |
+| :--- | :--- |
+| `search_tools` | **默认入口。** 用自然语言描述你要干什么，返回匹配的工具、说明、匹配依据和完整入参 Schema |
+| `list_tools` | 按服务列出全部工具名。搜索效果不理想时的目录式兜底 |
+| `describe_tool` | 查看单个工具的完整入参 Schema。低置信或 Schema 过长时用来确认 |
+| `execute_tool` | 执行真实工具。目标服务没在运行就即时唤醒，执行完原样返回结果 |
 
-```bash
-~/.mcp-adapter/
-├── config.json  # 注册的真实底层 MCP 服务与全局设置
-├── cache.json   # 缓存的所有底层服务的工具 Schema、哈希校验指纹与抓取时间
-└── logs/        # debug=true 时写入的文件日志目录；默认仅输出到 stderr
-```
-*注：可通过环境变量 `MCP_ADAPTER_HOME` 自定义上述工作根路径，支持 `~` 与 `~/...` 展开。生成的客户端配置会显式写入该变量。*
+模型侧的典型链路是 **`search_tools` → `execute_tool`** 两步：搜索一次就拿到了入参 Schema，高置信时可以直接执行。不确定时才插入 `describe_tool` 确认。
 
 ---
 
-## 4 个对外元工具 (Meta-Tools)
+## 快速开始
 
-### 1. `search_tools`
-* **功能：** 首选工具发现入口。检索所有配置的 MCP 工具，模糊匹配工具名、服务名、别名和描述正文。
-* **设计细节：** 返回候选工具的描述与完整 `inputSchema`，通常可直接据此调用 `execute_tool`。当 query 命中某个 server 但功能关键词未强匹配时，会返回该 server 下的候选工具作为兜底。为避免极端复杂工具 Schema 造成单次响应过大，`search_tools` 会对超长 `inputSchema` 做安全截断；如需完整 Schema，请使用 `describe_tool` 查询单个工具。
-* **参数：**
-  * `query` (string, 必填): 想要实现的诉求或功能关键字（如 `"siyuan sql"`, `"钉钉文档"`, `"search"`）。
-  * `server` (string, 可选): 目标服务提示（hint）。可填写真实 server key、中文名、英文名、aliases 或近似名称。高置信匹配时会在对应服务下窄化检索；存在歧义或低置信时会回退全局搜索，并将该提示作为搜索关键词参与排序。
-  * `limit` (number, 可选): 返回条数，默认 10，最大 20。
+### 方式一：让 AI 助手帮你装（推荐）
 
-### 2. `list_tools`
-* **功能：** 列出指定 MCP Server 的全部工具名称。
-* **设计细节：** 仅返回工具名，不返回描述和参数 Schema。用于 `search_tools` 结果不理想时的目录式兜底浏览。看到疑似工具名后，再调用 `describe_tool` 获取完整 schema。
-* **参数：**
-  * `server` (string, 必填): 服务名或 aliases。
-  * `limit` (number, 可选): 返回条数，取值 1–500，默认 500。工具数超过返回条数时会截断并在结果末尾给出提示；传入超过 500 的值会被参数校验拒绝。
+把下面这句话原样发给你的 AI 助手（Claude Code、Cursor、Codex 等），它会自己读完安装指南并把步骤执行完：
 
-### 3. `describe_tool`
-* **功能：** 获取指定单个工具的完整定义与入参 Schema。
-* **使用场景：** 已知工具名后确认参数，尤其适合从 `list_tools` 返回的工具名中选择疑似工具后调用。日常工具发现推荐优先使用 `search_tools`，因为其已返回完整 `inputSchema`，通常可直接 `execute_tool`。
-* **参数：**
-  * `tool` (string, 必填): 工具全名（如 `"siyuan-mcp.sql_query"`）或单纯的工具名。
-  * `server` (string, 可选): 用于解决同名工具冲突，指定服务名或别名。
+> 读一下 https://raw.githubusercontent.com/Lancernix/mcp-adapter/master/llm-install.md ，按里面的步骤帮我把 mcp-adapter 装好，并导入我现有的 MCP 配置。
 
-### 4. `execute_tool`
-* **功能：** 执行底层的真实工具。如果子进程处于休眠状态，会即时进行 Lazy 惰性唤醒、建立握手并分发，执行完毕后原样返回底层最真实的结果。
-* **参数：**
-  * `tool` (string, 必填): 真实的工具全名（如 `"siyuan-mcp.sql_query"`）。
-  * `server` (string, 可选): 用于多服务同名工具冲突时窄化范围。
-  * `arguments` (object, 可选): 符合该底层工具入参 Schema 的真实键值对。
+这份指南（[`llm-install.md`](./llm-install.md)）是**专门写给 AI 读的**：包含支持的客户端列表、`import` 命令的 dry-run 与正式导入、客户端配置回写、aliases 配置建议和安装验证清单。你也可以自己照着做。
 
----
+### 方式二：手动配置客户端
 
-## 安装与配置
+在你现有的 MCP 客户端配置里加一个 `mcp-adapter` 条目即可。
 
-### npx 直接使用（推荐）
-
-在 MCP 客户端配置中直接使用 npx，无需提前安装。推荐显式写入 `MCP_ADAPTER_HOME`，便于 Claude Code、OpenCode 等多个 AI 客户端隔离配置与缓存。
-
-Claude Code：
+Claude Code（`~/.claude.json`）：
 
 ```json
 {
@@ -115,15 +74,13 @@ Claude Code：
     "mcp-adapter": {
       "command": "npx",
       "args": ["-y", "@lancernix/mcp-adapter@latest"],
-      "env": {
-        "MCP_ADAPTER_HOME": "~/.mcp-adapter"
-      }
+      "env": { "MCP_ADAPTER_HOME": "~/.mcp-adapter" }
     }
   }
 }
 ```
 
-OpenCode：
+OpenCode（`~/.config/opencode/opencode.json`）：
 
 ```json
 {
@@ -131,84 +88,57 @@ OpenCode：
     "mcp-adapter": {
       "type": "local",
       "command": ["npx", "-y", "@lancernix/mcp-adapter@latest"],
-      "environment": {
-        "MCP_ADAPTER_HOME": "~/.mcp-adapter-opencode"
-      }
+      "environment": { "MCP_ADAPTER_HOME": "~/.mcp-adapter-opencode" }
     }
   }
 }
 ```
 
-> npx 首次运行后会将包缓存到 `~/.npm/_npx/`，后续启动直接使用缓存，不会重复下载。
+显式写 `MCP_ADAPTER_HOME` 是为了让多个 AI 客户端各用各的配置与缓存，互不干扰。npx 首次运行会把包缓存下来，之后启动不再下载。
 
-### npm 全局安装
+也可以全局安装后直接使用：
 
 ```bash
 npm install -g @lancernix/mcp-adapter
 ```
 
-安装后直接运行：
+### 方式三：导入已有的 MCP 配置
+
+已经把一堆服务配在 Claude Code / OpenCode 里了？用内置的 `import` 命令迁移到 mcp-adapter 的工作区，不用手抄。
 
 ```bash
-mcp-adapter
-```
-
-### 源码克隆并构建
-
-```bash
-git clone <repo-url> mcp-adapter
-cd mcp-adapter
-npm install
-npm run build
-```
-
-构建产物位于 `dist/` 目录。你可以将其链接到全局以便在任何地方调用：
-
-```bash
-npm link
-# 链接后可在系统任意位置通过 mcp-adapter 命令启动
-```
-
-### 导入现有客户端 MCP 配置
-
-若你此前已在 Claude Code 或 OpenCode 中配置了大量 MCP Server，可以使用内置导入工具把它们迁移到 mcp-adapter 的独立工作区。
-
-**先 dry-run 预览（推荐）：**
-
-```bash
-# Claude Code
+# 1. 先预览，看会导入哪些、跳过哪些
 npx -y @lancernix/mcp-adapter@latest import --client claude --from ~/.claude.json --dry-run
 
-# OpenCode
-npx -y @lancernix/mcp-adapter@latest import --client opencode --from ~/.config/opencode/opencode.json --dry-run
-```
-
-dry-run 会显示源配置、目标 `config.json`、导入/跳过的 server，以及将写回客户端配置的 `mcp-adapter` 入口。
-
-**正式导入 adapter 配置：**
-
-```bash
-# Claude Code -> ~/.mcp-adapter/config.json
+# 2. 确认无误后正式导入（只写 mcp-adapter 自己的 config.json，不动客户端配置）
 npx -y @lancernix/mcp-adapter@latest import --client claude --from ~/.claude.json
 
-# OpenCode -> ~/.mcp-adapter-opencode/config.json
-npx -y @lancernix/mcp-adapter@latest import --client opencode --from ~/.config/opencode/opencode.json
-```
-
-默认不会修改原客户端配置。确认 dry-run 后，如需把客户端 MCP 区域替换为单个 `mcp-adapter` 入口，显式添加 `--write-client-config`：
-
-```bash
+# 3. 可选：把客户端 MCP 区域替换成单个 mcp-adapter 入口
 npx -y @lancernix/mcp-adapter@latest import --client claude --from ~/.claude.json --write-client-config
-npx -y @lancernix/mcp-adapter@latest import --client opencode --from ~/.config/opencode/opencode.json --write-client-config
 ```
 
-如果系统中只检测到一个受支持客户端配置，也可以运行 `import --dry-run` 自动预览；正式导入仍建议显式指定 `--client` 与 `--from`，避免误导入。
+支持的客户端与默认路径：
+
+| 客户端 | `--client` | 默认配置路径 |
+| :--- | :--- | :--- |
+| Claude Code | `claude` | `~/.claude.json` |
+| OpenCode | `opencode` | `$OPENCODE_CONFIG` 或 `~/.config/opencode/opencode.json` |
+
+工作区（`MCP_ADAPTER_HOME`）默认位置：
+
+```text
+~/.mcp-adapter/                 # Claude Code
+~/.mcp-adapter-opencode/        # OpenCode
+├── config.json                 # 你注册的真实 MCP 服务 + 全局设置
+├── cache.json                  # 自动生成的工具目录缓存，不用手改
+└── logs/                       # 仅 debug: true 时写入
+```
 
 ---
 
-## 配置详解 (`config.json`)
+## 配置
 
-默认配置文件结构如下：
+网关的所有行为都在工作区的 `config.json` 里。完整示例：
 
 ```json
 {
@@ -217,20 +147,19 @@ npx -y @lancernix/mcp-adapter@latest import --client opencode --from ~/.config/o
     "idleTimeout": 10,
     "cacheTtlDays": 7,
     "toolSearchLimit": 10,
-    "metadataBootstrap": "background",
+    "startupMetadataCheck": true,
     "debug": false,
     "connectTimeoutMs": 60000,
     "requestTimeoutMs": 60000,
-    "closeTimeoutMs": 10000
+    "closeTimeoutMs": 10000,
+    "failureBackoffMs": 60000
   },
   "mcpServers": {
     "siyuan-mcp": {
       "type": "stdio",
       "command": "node",
       "args": ["/path/to/siyuan-mcp/dist/index.js"],
-      "env": {
-        "SIYUAN_API_KEY": "xxxx"
-      },
+      "env": { "SIYUAN_API_KEY": "xxxx" },
       "lifecycle": "lazy",
       "idleTimeout": 5,
       "aliases": ["思源", "笔记", "siyuan"]
@@ -238,156 +167,229 @@ npx -y @lancernix/mcp-adapter@latest import --client opencode --from ~/.config/o
     "dingtalk-doc": {
       "type": "http",
       "url": "https://mcp-gw.dingtalk.com/server/xxx?key=xxx",
-      "lifecycle": "lazy",
-      "refreshOnStartup": true,
       "aliases": ["钉钉", "钉钉文档"]
     }
   }
 }
 ```
 
+> 通常你不需要手写这个文件——用上面的 `import` 命令生成即可。只有在调优（配 aliases、改超时、隐藏工具）时才需要改它。
+
 ### 全局 `settings`
-| 字段 | 类型 | 默认值 | 描述 |
+
+| 字段 | 类型 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `idleTimeout` | `number` | `10` | 默认全局子进程闲置自动退出的时间（单位：分钟） |
-| `cacheTtlDays` | `number` | `7` | 工具缓存的有效生存期（天），过期后会在后台 bootstrap、search_tools/describe_tool/list_tools 明确定位 server 时自动刷新。设为 `0` 表示缓存不因 TTL 过期（仅在 server 配置哈希变化时自动刷新） |
-| `toolSearchLimit` | `number` | `10` | `search_tools` 默认返回数量。单次调用最大 20 |
-| `metadataBootstrap` | `"background"` \| `"off"` | `"background"` | 启动后是否在后台自动刷新缺失/失效的 metadata 缓存 |
-| `debug` | `boolean` | `false` | 是否开启文件日志。默认仅输出到 stderr；设为 `true` 后会额外写入 `logs/mcp-adapter.log`。日志持续追加，请仅在排查问题时开启并定期清理 |
-| `connectTimeoutMs` | `number` | `60000` | 连接底层 MCP 服务的超时时间（毫秒）。设为 `0` 表示禁用超时 |
-| `requestTimeoutMs` | `number` | `60000` | `listTools` / `callTool` 等请求的超时时间（毫秒）。设为 `0` 表示禁用超时 |
-| `closeTimeoutMs` | `number` | `10000` | 关闭底层连接的超时时间（毫秒）。设为 `0` 表示禁用超时（例外：进程退出清理为保证可靠退出，即使设为 `0` 也会按 10 秒执行） |
-| `failureBackoffMs` | `number` | `60000` | 服务连接失败后的冷却窗口（毫秒）。冷却期内再次调用会快速失败并提示剩余等待时间，避免反复付出完整的连接超时；连接成功后自动解除。设为 `0` 关闭冷却 |
+| `idleTimeout` | number | `10` | 闲置多少分钟（后自动回收子进程）。设为 `<= 0` 表示**禁用自动回收** |
+| `cacheTtlDays` | number | `7` | 工具目录缓存的保鲜期（天）。设为 `0` 表示不因时间过期，只在服务配置变化时重刷 |
+| `toolSearchLimit` | number | `10` | `search_tools` 默认返回条数，单次最多 20 |
+| `startupMetadataCheck` | boolean | `true` | 启动后是否在后台做一次缓存体检（详见下方说明） |
+| `debug` | boolean | `false` | 开启后额外把日志写入 `logs/mcp-adapter.log`。排查问题时再开，日志会持续追加 |
+| `connectTimeoutMs` | number | `60000` | 连接底层服务的超时（毫秒），`0` 表示不限 |
+| `requestTimeoutMs` | number | `60000` | 单次工具调用 / 拉取工具列表的超时（毫秒），`0` 表示不限 |
+| `closeTimeoutMs` | number | `10000` | 关闭底层连接的超时（毫秒）。进程退出路径上有 6 秒的保底预算，配得比这更短不会生效 |
+| `failureBackoffMs` | number | `60000` | 服务连接失败后的冷却窗口（毫秒）。冷却期内再次调用会立刻返回失败提示，而不是让你干等一次连接超时。`0` 表示关闭冷却 |
 
-### 服务专属 `mcpServers` 配置项
-除了标准的 `command`、`args`、`env`、`cwd` 字段，网关新增了如下扩展配置：
-* `type` (string, 默认 `"stdio"`): 连接方式。
-  * `"stdio"`: 本地子进程（需配置 `command`，`args` 可选）。
-  * `"http"` / `"sse"`: 远程服务（需配置 `url`，可选 `headers`）。
-* `url` (string, HTTP/SSE 必填): 远程 MCP 服务端点地址。
-* `headers` (object, 可选): HTTP/SSE 请求附加的自定义请求头。
-* `lifecycle` (string, 默认 `"lazy"`): 
-  * `"lazy"`: 惰性连接。按需唤醒进程，闲置超过 `idleTimeout` 自动杀死释放物理内存（推荐，低内存宿主机黄金搭档）。
-  * `"eager"` / `"keep-alive"`: 预留模式。当前版本仅表示服务一旦被连接后不参与 idle sweeper，不会因空闲被自动关闭；冷启动主动拉起将在后续版本支持。
-* `idleTimeout` (number, 可选): 覆盖全局设置，单独指定该子进程闲置被杀死的超时时间（分钟）。
-* `aliases` (string[], 可选): 服务器别名。可定义该服务的中文别名（如 `["思源", "思源笔记"]`），`search_tools` 会将其无缝纳入权重检索中。
-* `disabled` (boolean, 可选): 设为 `true` 则会在模糊搜索及工具执行时临时屏蔽该服务（`search_tools` 不会列出其工具，`execute_tool` 会拒绝调用）。
-* `refreshOnStartup` (boolean, 可选): 设为 `true` 时，该 server 会在 adapter 每次启动后的后台 bootstrap 中强制刷新 metadata cache，跳过缓存有效性检查。推荐用于 HTTP/SSE 等在线服务或工具列表可能动态变化的服务。对 stdio 服务也生效，但会在每次启动后后台拉起对应子进程，请谨慎开启。
-* `inheritEnv` (boolean, 可选, 仅 stdio, 默认 `true`): 是否继承宿主进程的全部环境变量。设为 `false` 时，子进程仅保留 SDK 的跨平台安全默认集（如 `PATH`、`HOME`）与显式配置的 `env`，不携带宿主任意变量——适合多 agent 共享宿主机、或不想把本地凭证泄给底层服务的场景。注意这不是空环境，也不是 OS 沙箱。
-* `includeTools` (string[], 可选): 工具白名单。支持精确工具名或通配符（`sql_*`、`get?`），只有匹配的工具会被搜索、描述、列出和执行。
-* `excludeTools` (string[], 可选): 工具黑名单，在 `includeTools` 之后应用。被排除的工具不可发现也不可执行。适合在保留整个服务接入的同时隐藏用不到的工具（如管理类接口），进一步压缩搜索面。
-* `bearerTokenEnv` (string, 可选, 仅 http/sse): 从指定环境变量读取 token，连接时自动注入 `Authorization: Bearer <token>` 请求头，避免明文 token 写入 config.json。若 `headers` 中已显式配置 `Authorization` 则以显式配置为准；指定的环境变量缺失或为空时连接会报错。
-* `connectTimeoutMs` / `requestTimeoutMs` / `closeTimeoutMs` (number, 可选): 覆盖全局对应超时设置，单位为毫秒。适用于个别响应较慢的服务（如报表生成类工具）。
+**`startupMetadataCheck` 是干什么的。** 开启（默认）时，网关每次启动后会在**后台**逐服务检查一遍工具目录缓存是否还能用——检查三件事：缓存是否存在、服务的启动配置有没有变、缓存是否超过 `cacheTtlDays`。只有失效的才会重新拉取。全部有效时什么都不做，只是打一行日志。
 
-### aliases 最佳实践
+这个检查**不阻塞任何操作**：网关先就绪，你随时可以搜索和执行；检查是串行的，每刷完一个服务立刻生效，所以工具是"一个一个冒出来"的。唯一可能让你多等一会儿的情况，是你恰好针对**正在被检查的那个服务**发起检索——这时会复用那次检查，最多等一个服务的时长。
 
-`aliases` 直接影响 `search_tools` 的服务识别、query 中服务名检测和搜索结果排序加权。**如果你的服务使用了中文名或其他常用别称，强烈建议配置 aliases。**
+设为 `false` 则不做这次主动检查。注意它**不等于缓存冻结**：当你带着服务名去检索、而该服务缓存已失效时，网关仍会顺手刷新它。
 
-`search_tools` 的 `server` 参数是**服务提示（hint）**，不要求精确的 server key。你可以填入自然语言服务名、中文名、别名或近似名称（如 `"钉钉文档"`、`"dingtalk"`、`"dingtalk doc"`），网关会自动尝试匹配。如果无法高置信匹配，会自动回退全局搜索而不是报错。
+### 服务专属配置项
 
-推荐配置如下：
+除标准的 `command`、`args`、`env`、`cwd`（stdio）与 `url`、`headers`（http/sse）外，网关提供这些扩展：
 
-```json
-{
-  "mcpServers": {
-    "dingtalk-doc": {
-      "aliases": ["钉钉", "钉钉文档", "dingtalk", "dingtalk doc", "dingding"]
-    },
-    "siyuan-mcp": {
-      "aliases": ["思源", "思源笔记", "siyuan", "siyuan note"]
-    },
-    "feishu-bitable": {
-      "aliases": ["飞书", "飞书多维表格", "多维表格", "bitable", "feishu", "lark"]
-    },
-    "github": {
-      "aliases": ["GitHub", "github.com", "gh"]
-    }
-  }
-}
-```
+| 字段 | 类型 | 说明 |
+| :--- | :--- | :--- |
+| `type` | string | `"stdio"`（默认，本地子进程）/ `"http"` / `"sse"`（远程服务） |
+| `aliases` | string[] | **强烈建议配置。** 服务别名，直接影响搜索命中率。中文服务名必须配，网关不会自动生成中文变体 |
+| `lifecycle` | string | `"lazy"`（默认，按需唤醒 + 闲置回收）/ `"eager"`（启动后后台预热，之后不参与闲置回收，适合启动慢但每次会话都用得到的服务）/ `"keep-alive"`（不做预热，但一旦连接就不被回收） |
+| `idleTimeout` | number | 覆盖全局设置，单独指定该服务的闲置回收时间（分钟），`<= 0` 表示该服务禁用回收 |
+| `disabled` | boolean | 临时屏蔽该服务：搜不到、列不出、也执行不了 |
+| `refreshOnStartup` | boolean | 该服务在启动期缓存体检时**跳过缓存检查、无条件重新拉取工具列表**。适合工具列表会动态变化的在线服务 |
+| `includeTools` | string[] | 工具白名单，支持 `sql_*`、`get?` 通配符。只有匹配的工具会对外暴露 |
+| `excludeTools` | string[] | 工具黑名单，在 `includeTools` 之后应用。被排除的工具既搜不到也执行不了 |
+| `inheritEnv` | boolean | 仅 stdio，默认 `true`。设为 `false` 时子进程只保留 SDK 的跨平台安全默认集（`PATH`、`HOME` 等）加显式 `env`，不携带宿主任意变量 |
+| `bearerTokenEnv` | string | 仅 http/sse。从该环境变量读取 token 并注入 `Authorization: Bearer`，避免明文写进 `config.json` |
+| `connectTimeoutMs` / `requestTimeoutMs` / `closeTimeoutMs` | number | 覆盖全局超时，适合个别响应很慢的服务 |
+
+**`refreshOnStartup` 与 `startupMetadataCheck` 的区别。** 两者是不同维度，不是同一件事的两种写法：
+
+- `settings.startupMetadataCheck`（全局）决定**要不要做这次体检**
+- `x.refreshOnStartup`（单服务）决定**体检时这个服务要不要跳过缓存检查**
+
+典型组合：全局保持默认做体检，只给工具列表经常变的那一两个在线服务加 `"refreshOnStartup": true`。
+
+> 历史字段 `metadataBootstrap`（`"background"` / `"off"`）是 `startupMetadataCheck` 的旧名字。旧配置仍然可用，读取时会自动等价转换（`"background"` → `true`，`"off"` → `false`）并在启动日志里提示你改名。新配置请只用 `startupMetadataCheck`。
+
+### aliases 怎么配
+
+`aliases` 决定了 `search_tools` 能不能听懂你对服务的口语化称呼。
 
 规则：
-- 中文服务名**必须**配置 aliases，网关不会自动生成中文变体
-- 英文 server key 中的分隔符（`-`、`_`、`.`）会被自动归一化为空格，无需单独配置 `dingtalkdoc` 之类变体
-- `search_tools` 会优先匹配 aliases 精确命中项并加权排序
-- 如果你不确定 aliases 是否足够，可以在实际使用 `search_tools` 时观察匹配结果中的 `matchReasons` 来调整
 
----
-
-## 客户端接入示例
-
-### Claude Code
+- **中文服务名必须配 aliases**，网关不会自动生成中文变体
+- 英文 server key 里的 `-`、`_`、`.` 会被自动归一化成空格，不用额外配 `dingtalkdoc` 这种变体
+- `search_tools` 的 `server` 参数是**提示（hint）**，填中文名、别名或近似名称都行，不需要精确的 server key；匹配不上会自动回退全局搜索，不会报错
 
 ```json
 {
   "mcpServers": {
-    "mcp-adapter": {
-      "command": "npx",
-      "args": ["-y", "@lancernix/mcp-adapter@latest"],
-      "env": {
-        "MCP_ADAPTER_HOME": "~/.mcp-adapter"
-      }
-    }
+    "dingtalk-doc": { "aliases": ["钉钉", "钉钉文档", "dingtalk", "dingding"] },
+    "siyuan-mcp": { "aliases": ["思源", "思源笔记", "siyuan"] },
+    "github": { "aliases": ["GitHub", "gh"] }
   }
 }
 ```
 
-### OpenCode
-
-```json
-{
-  "mcp": {
-    "mcp-adapter": {
-      "type": "local",
-      "command": ["npx", "-y", "@lancernix/mcp-adapter@latest"],
-      "environment": {
-        "MCP_ADAPTER_HOME": "~/.mcp-adapter-opencode"
-      }
-    }
-  }
-}
-```
-
-配置完成后，AI 客户端冷启动阶段只需加载 mcp-adapter 和 4 个元工具。若 metadata cache 已有效，adapter 不会唤醒真实 MCP；若 cache 缺失或失效，adapter 会在接入客户端后于后台顺序刷新 metadata。若刷新过程中临时创建了连接，则该 server 刷新完成后立即关闭；若该连接正在被其他请求复用，则不会误关，后续交由 idle sweeper 自动释放。当 AI 客户端检索或调用具体功能时，网关将在幕后惰性地调度对应的真实底层进程。
+配完可以实际搜一次，看返回里的 `匹配依据`（matchReasons）判断是否需要补充。
 
 ---
 
-## 开发者提示
+## 常见问题
 
-### 缓存自举引导
-网关启动时若检测到 `cache.json` 为空但 `config.json` 中已配置服务，会在**接入客户端之后**，于后台依次连接所有非禁用服务，拉取工具列表写入缓存。若刷新过程中临时创建了连接，则拉取完成后立即关闭；若该连接正在被其他请求复用，则不会误关，后续交由 idle sweeper 释放。启动完成后 `search_tools` 可逐步检索到工具，无需手动触发。可通过 `settings.metadataBootstrap` 设为 `"off"` 关闭此后台行为。
+**搜不到我想要的工具？**
+先确认这个服务在 `config.json` 里、且没有 `disabled`。然后：
 
-缓存刷新的两个时机：
-* **哈希变更**：`config.json` 中某服务的 `command`、`args`、`env`、`url` 等影响工具集的字段发生变化 → 下次连接时自动重新发现
-* **TTL 过期**：缓存条目超过 `cacheTtlDays`（默认 7 天） → 下次 metadata 刷新时自动重新发现
+- 带服务名搜：`search_tools(query="...", server="服务名或别名")` —— 这会强制刷新该服务的缓存再搜
+- 服务名也搜不到，用 `list_tools(server="...")` 看它到底暴露了哪些工具
+- 确认是缓存太旧（服务升级了但配置没变），可以删掉 `cache.json` 重启，或给该服务加 `"refreshOnStartup": true`
 
-> **为什么只缓存 tools，不缓存 prompts 和 resources？**
-> 
-> MCP 协议定义了三种能力：Tools、Prompts、Resources。当前 `mcp-adapter` 仅缓存和代理 Tools，原因：
-> * **Tools** 是唯一有数量爆炸问题的能力——几十个服务 × 几十个工具 × 复杂 Schema = 数万 token 上下文开销，必须拦截。
-> * **Prompts** 生态未成熟，Claude Code 当前版本不支持 MCP Prompts，实际无人使用。
-> * **Resources** 数量通常很少（每个服务 5-10 个），且一般通过 URI 直接引用，不依赖模糊搜索发现。
+**会不会一启动就把所有服务都拉起来？**
+不会。只要缓存有效，启动过程一个子进程都不会拉。缓存缺失或失效时才会在后台把对应服务拉起来读一次工具列表，读完立刻关掉（除非那一刻正好有别的请求在用它）。
 
-### 缓存哈希
-网关通过 **黑名单策略** 计算每个服务的配置指纹：排除 `aliases`、`lifecycle`、`disabled`、`idleTimeout`、`refreshOnStartup`、`connectTimeoutMs`、`requestTimeoutMs`、`closeTimeoutMs`、`includeTools`、`excludeTools` 等 adapter 元数据字段，其余所有字段（`type`、`command`、`args`、`env`、`cwd`、`url`、`headers` 及未来新增字段）全部纳入 SHA256。配置不变则复用缓存，变更则自动重新发现。
+**子进程什么时候退出？**
+默认闲置 10 分钟后自动回收（`idleTimeout` 可调，也可按服务覆盖）。正在执行请求的连接不会被回收。
 
-### 代码规范与自愈
-* 项目基于 TypeScript 编写。修改代码后，需执行 `npm run build` 生成生产 JavaScript。
-* 底层通信严格遵循官方标准 MCP 协议，支持 SDK 内置的 Stdio、Streamable HTTP、SSE 三种传输方式。认证信息可通过 `headers` 或 `env` 配置传入。
-* 代码使用 biome 作为 linter/formatter，TS 编译启用 `strict` 模式。已消除所有显式 `any` 和非空断言（类型断言均为具体类型，如 `as unknown as MetadataCache`，无 `as any`）。
+**同时用 Claude Code 和 OpenCode 会互相干扰吗？**
+不会，只要给它们配不同的 `MCP_ADAPTER_HOME`。`import` 命令生成的配置会自动这么做。
 
-### 发版流程（维护者）
-本仓库采用**手动控制版本**：版本号的唯一来源是 `package.json` 的 `version` 字段，发版通过打 tag 触发，仅 push `master` 只会运行 CI（lint + build + 测试），不会发布。
+**要不要把工具名单写全？**
+不需要。想减少噪音可以用服务的 `includeTools` / `excludeTools` 精确控制哪些工具对外可见——被排除的工具既搜不到也执行不了。
 
-1. 更新 `package.json` 中的 `version`（遵循 semver）
-2. 合并代码到 `master`
-3. 打 tag 并推送：`git tag v<x.y.z> && git push origin v<x.y.z>`
+**为什么只代理 Tools，不代理 Prompts 和 Resources？**
+MCP 协议定义了三种能力，网关目前只拦截 Tools。原因很直接：Tools 是唯一有数量爆炸问题的能力（几十个服务 × 几十个工具 × 复杂 Schema = 数万 token），必须拦。Prompts 生态尚未成熟；Resources 数量通常很少（每个服务 5–10 个）且一般通过 URI 直接引用，不依赖模糊搜索发现。
 
-tag 推送后 CI 自动完成：校验 tag 与 `package.json` 版本一致（不一致直接拒绝发布）→ lint + build + 测试 → `npm publish`（走 npm Trusted Publishing / OIDC 认证，无需任何 token，自动附带 provenance）→ 自动创建 GitHub Release。
+---
 
-前置条件（一次性）：在 npmjs.com 的包设置中配置 Trusted Publisher（Provider: GitHub Actions，Owner: `Lancernix`，Repository: `mcp-adapter`，Workflow: `main.yaml`，Environment: `release`）。CI 配置见 `.github/workflows/main.yaml`。
+## 工作原理
 
-### 进程生命周期
-* 强烈建议在低配 VPS 上开启 `"lifecycle": "lazy"`。网关会在高频调用后进入闲置轮询，将进程优雅退温，宿主机将始终保持轻量健康的负载表现。
-* 收到 `stdin.close` / `SIGINT` / `SIGTERM` 时，统一的 `shutdownAndExit` 流程会先移除这些监听器，并通过 once guard 防止二次清理，随后按顺序释放全部底层连接与子进程。
-* 这套清理只在**有退出信号**的前提下生效。若父进程被 `kill -9` 或 OOM 强杀，网关自身来不及执行任何清理，底层子进程将残留为孤儿进程。这类场景需要在宿主机层面兜底（如进程组 kill、容器生命周期钩子）。
+<details>
+<summary>展开：缓存、搜索评分与进程调度（排查问题或二次开发时看）</summary>
+
+### 工具目录缓存
+
+网关不实时查询底层服务，而是把工具元数据缓存在 `cache.json`。缓存有效性由三条校验共同决定：
+
+1. **结构合法** —— 条目必须包含完整的指纹与工具列表
+2. **配置指纹匹配** —— 对服务的 `ServerConfig` 做 SHA256，采用**黑名单策略**：除 `aliases`、`lifecycle`、`includeTools` 等 adapter 侧元数据外，其余字段全部进指纹。好处是以后新增连接相关字段会自动纳入，不需要维护白名单；改元数据类字段不会触发重新发现
+3. **未超期** —— 不超过 `cacheTtlDays`
+
+任一条不通过就在下次需要时重新拉取。这是个**最终一致**的设计：它能发现"配置变了"，但发现不了"服务内部工具变了而配置没动"——后者靠 TTL、`refreshOnStartup` 或手动删除缓存兜底。这样换来的是"每次搜索都不需要拉起子进程"。
+
+### 搜索评分
+
+三层召回 + 统一排序：
+
+- **BM25** 负责词项相关性与长度归一化
+- **Fuse.js token search** 负责 typo、大小写、多词乱序
+- **IDF 字段加权**让低频特征词和关键字段（工具名、服务别名）命中时权重更高
+
+最终合成一个分数，并输出 `matchReasons` 告诉模型"这个候选为什么被召回"，辅助判断是直接执行还是继续 `describe_tool`。没有用 embedding：工具元数据规模在百到千级、字段明确，本地轻量检索足够，还省掉了索引构建、缓存失效重算和模型依赖。
+
+### 进程调度
+
+- **并发去重**：同一服务的并发首次调用复用同一个建连 Promise，不会重复拉起进程
+- **崩溃自愈**：底层连接意外断开时主动把它摘出连接池，下一次调用重新冷启动，而不是反复复用一条已断开的连接
+- **超时不连坐**：某个请求超时后，该连接被标记为"退役"（新请求会建新连接），但要等最后一个在途请求结束才物理关闭——直接强关会让同一连接上其他正常请求一起失败
+- **有序退出**：收到客户端断开或 `SIGINT`/`SIGTERM` 时，按「熔断新建 → 清半连接资源 → 等在途建连结束 → 回收已退役连接 → 关闭稳定连接池」的顺序释放全部子进程
+
+> 边界：这套清理只在**有退出信号**时生效。父进程被 `kill -9` 或 OOM 强杀时，网关来不及做任何事，底层子进程只能靠 stdin 断开自救。这是子进程模型的结构性限制，需要在宿主机层面兜底（进程组 kill、容器生命周期钩子）。
+
+</details>
+
+---
+
+## 开发与维护
+
+<details>
+<summary>展开：测试、发版流程与代码规范（维护者看）</summary>
+
+### 从源码开发
+
+```bash
+git clone https://github.com/Lancernix/mcp-adapter.git
+cd mcp-adapter
+npm install
+npm run build          # 产物在 dist/，也可以 npm link 后全局调用
+```
+
+### 测试
+
+```bash
+npm test        # tsx --test --test-timeout=120000 __tests__/*.test.ts
+npm run check   # biome lint + format 检查
+npm run build   # tsc 编译到 dist/
+```
+
+测试**不依赖网络、不依赖任何真实 MCP 服务**，可在本地与 CI 稳定重跑。分两层：
+
+**端到端**（真实拉起 adapter 进程 + 真实 stdio 协议，验证"客户端看到的行为"）：
+
+| 文件 | 覆盖内容 |
+| :--- | :--- |
+| `__tests__/meta-tools-main.e2e.test.ts` | 4 个元工具的暴露面、冷启动写缓存与启动日志、search 的各类命中与兜底、search→execute 闭环、list/describe、长文本原样透传、未知工具引导 |
+| `__tests__/meta-tools-filters.e2e.test.ts` | 重名冲突（describe 与 execute 双路径）、`includeTools`/`excludeTools` 的可见性与可执行性、disabled 完全隔离、关闭体检后的按需刷新 |
+| `__tests__/meta-tools-env-cwd.e2e.test.ts` | `env` / `inheritEnv` / `cwd` 是否真的作用到了子进程 |
+| `__tests__/meta-tools-eager.e2e.test.ts` | eager 启动预热、预热不写缓存、keep-alive 与 lazy 不预热、崩溃后无守护（不自动重启） |
+| `__tests__/meta-tools-degrade.e2e.test.ts` | server 提示指向不可用服务时降级为全局搜索、一次搜索内不对同一服务重复刷新 |
+| `__tests__/meta-tools-exit.e2e.test.ts` | 缓存有效时不产生额外进程、优雅退出不留孤儿、忽略 `SIGTERM` 的子进程仍被 `SIGKILL` 收敛 |
+
+> e2e 按关注点拆成多文件，是因为 `node:test` 以**文件**为单位并行调度：拆开后各文件独立进程并发跑，全量耗时从约 14s 降到约 6s。共享设施（`startAdapter` / `fakeServer` / `callTool` / `waitForCache`）集中在 `__tests__/e2e-harness.ts`（不以 `.test.ts` 结尾，不会被收集成用例）。
+
+**单元**（直接调用内部模块，验证并发、资源释放与缓存语义）：
+
+| 文件 | 覆盖内容 |
+| :--- | :--- |
+| `__tests__/process-lifecycle.test.ts` | 并发建连去重、失败可重试、崩溃自愈、超时退役不误杀在途请求、eager 预热、闲置回收边界、`shutdownAll` 收敛与孤儿进程防护 |
+| `__tests__/cache-manager.test.ts` | 配置指纹稳定性与元数据字段排除、有效性三校验、原子写与合并、并发写队列、mtime 快照与跨进程可见性、`getValidCachedServers` |
+| `__tests__/server-options.test.ts` | `includeTools`/`excludeTools` 的匹配语义（含 `?` 通配与大小写）、`resolveCwd`、`buildChildEnv` 与 `inheritEnv`、`FailureBackoff` |
+| `__tests__/config-legacy-migration.test.ts` | 旧字段 `metadataBootstrap` 的兼容与落盘迁移 |
+| 其余 | 客户端配置适配、搜索索引、server hint 解析、`resolveHttpHeaders`、失败冷却等 |
+
+**单一归属原则**：同一件事只在**一个**文件里被测试——缓存层归 `cache-manager.test.ts`，服务配置解析归 `server-options.test.ts`，两者不重叠。跨文件复用的工具（进程存活探测、轮询等待、假 server 定位与 spawn 记录读取、临时工作区）集中在 `__tests__/helpers.ts`（不以 `.test.ts` 结尾，不会被收集成用例）。
+
+测试夹具：`__tests__/fixtures/fake-mcp-server.mjs` 是一个**零依赖**的最小 MCP stdio server（手写 JSON-RPC 循环），通过环境变量精确制造故障场景：
+
+| 环境变量 | 作用 |
+| :--- | :--- |
+| `FAKE_SPAWN_LOG` | 每次启动把自身 pid 追加到该文件，用于精确统计 spawn 次数 |
+| `FAKE_INIT_DELAY_MS` | 延迟 `initialize` 响应，制造"建连中"状态 |
+| `FAKE_STUBBORN` | 设为 `1` 后忽略 stdin 关闭与 `SIGTERM`，只能被 `SIGKILL` 杀死 |
+
+暴露的工具（与 `__tests__/e2e-harness.ts` 的 `FAKE_TOOLS` 常量同步）：`echo` / `sleep` / `pid` / `crash`（直接 `process.exit(7)` 模拟崩溃）/ `env` / `cwd` / `fail`。
+
+> 改动 `src/server-manager.ts`、`src/lifecycle.ts` 或 4 个元工具的入口逻辑后，务必先确认 `npm test` 全绿再提交。
+
+### 发版流程
+
+版本号唯一来源是 `package.json` 的 `version`，发版通过打 tag 触发。仅 push `master` 只会跑 CI，不会发布。
+
+1. 更新 `package.json` 的 `version`（遵循 semver）
+2. 本地确认三道门全绿：`npm run check` → `npm run build` → `npm test`
+3. 合并到 `master`
+4. 打 tag 并推送：`git tag v<x.y.z> && git push origin v<x.y.z>`
+
+tag 推送后 CI 自动完成：校验 tag 与 `package.json` 版本一致 → lint + build + 测试 → `npm publish`（Trusted Publishing / OIDC，无需 token，附带 provenance）→ 创建 GitHub Release。CI 配置见 `.github/workflows/main.yaml`。
+
+### 代码规范
+
+TypeScript + `strict` 模式，biome 作为 linter/formatter，无显式 `any`、无非空断言。底层通信遵循官方 MCP 协议，支持 SDK 内置的 Stdio / Streamable HTTP / SSE 三种传输。
+
+</details>
+
+---
+
+## License
+
+MIT

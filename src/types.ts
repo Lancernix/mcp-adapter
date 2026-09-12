@@ -26,10 +26,16 @@ export interface ServerConfig {
 }
 
 export interface GlobalSettings {
-  idleTimeout?: number; // 默认：10 分钟
+  idleTimeout?: number; // 默认：10 分钟；<= 0 表示禁用闲置回收
   cacheTtlDays?: number; // 默认：7 天
   toolSearchLimit?: number; // 默认：10 个，search_tools 单次最大 20
-  metadataBootstrap?: "background" | "off"; // 默认：background
+  startupMetadataCheck?: boolean; // 默认：true，启动后是否在后台做一次 metadata 缓存体检
+  /**
+   * @deprecated 已更名为 startupMetadataCheck。
+   * 仅在读取旧配置时被兼容：metadataBootstrap: "background" → true，"off" → false。
+   * 归一化后该字段会被删除，运行期对象里不存在，写入配置一律使用 startupMetadataCheck。
+   */
+  metadataBootstrap?: "background" | "off";
   debug?: boolean; // 默认：false，开启后写日志到 logs/mcp-adapter.log
   connectTimeoutMs?: number; // 默认：60000
   requestTimeoutMs?: number; // 默认：60000
