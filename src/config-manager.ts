@@ -8,6 +8,7 @@ import { AdapterConfigSchema } from "./config-schema.js";
 import { normalizeForSearch } from "./search-utils.js";
 import type {
   AdapterConfig,
+  GlobalSettings,
   ServerConfig,
   ServerResolveResult,
 } from "./types.js";
@@ -67,7 +68,7 @@ export function ensureConfigFile(): void {
         idleTimeout: 10,
         cacheTtlDays: 7,
         toolSearchLimit: 10,
-        metadataBootstrap: "background",
+        startupMetadataCheck: true,
         debug: false,
         connectTimeoutMs: 60000,
         requestTimeoutMs: 60000,
@@ -95,13 +96,60 @@ function formatZodError(err: z.ZodError): string {
   return err.issues.map((i) => `[${i.path.join(".")}] ${i.message}`).join("; ");
 }
 
+// ---- 配置字段迁移 ----
+//
+// 这是整个兼容层的唯一入口。业务代码里不允许出现 `if (metadataBootstrap)` 之类的
+// 分支：旧字段在 loadConfig() 返回前就被改写成新字段并删除，下游只有一个数据源。
+// 写入路径（ensureConfigFile 的模板、saveConfig、import）一律只产出新字段，
+// 所以任何一次落盘都会顺带完成迁移。等下一个主版本再删掉这里的兼容分支。
+
+const configMigrationNotes: string[] = [];
+
+/**
+ * 取出并清空本次配置加载产生的迁移提示。
+ * 由调用方（index.ts 的 initialize）负责写日志，避免 config-manager 反向依赖 logger。
+ */
+export function takeConfigMigrationNotes(): string[] {
+  return configMigrationNotes.splice(0, configMigrationNotes.length);
+}
+
+function migrateLegacySettings(config: AdapterConfig): void {
+  const settings = config.settings as
+    | (GlobalSettings & Record<string, unknown>)
+    | undefined;
+  if (!settings) return;
+
+  // JSON 里不存在 undefined，字段缺失与字段有值可以直接区分
+  const legacy = settings.metadataBootstrap;
+  if (legacy === undefined) return;
+
+  if (settings.startupMetadataCheck === undefined) {
+    settings.startupMetadataCheck = legacy !== "off";
+    configMigrationNotes.push(
+      `settings.metadataBootstrap 已更名为 settings.startupMetadataCheck` +
+        `（${legacy} → ${settings.startupMetadataCheck}），本次已按新语义生效。` +
+        `请把 config.json 中的 metadataBootstrap 改写为 startupMetadataCheck 以消除本提示`,
+    );
+  } else {
+    configMigrationNotes.push(
+      `settings.metadataBootstrap 已废弃，且与 settings.startupMetadataCheck 同时存在。` +
+        `已按 startupMetadataCheck=${settings.startupMetadataCheck} 生效，请删除 metadataBootstrap`,
+    );
+  }
+
+  // 归一化后立即删除旧字段，保证运行期对象里不存在两个同义字段
+  delete settings.metadataBootstrap;
+}
+
 export function loadConfig(): AdapterConfig {
   ensureConfigFile();
   const configPath = getConfigPath();
   try {
     const raw = fs.readFileSync(configPath, "utf-8");
     const parsed = JSON.parse(raw);
-    return AdapterConfigSchema.parse(parsed) as AdapterConfig;
+    const config = AdapterConfigSchema.parse(parsed) as AdapterConfig;
+    migrateLegacySettings(config);
+    return config;
   } catch (err) {
     if (err instanceof z.ZodError) {
       throw new Error(`config.json 格式校验失败: ${formatZodError(err)}`);

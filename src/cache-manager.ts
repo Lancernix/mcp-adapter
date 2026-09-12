@@ -18,13 +18,10 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
-export function loadMetadataCache(): MetadataCache | null {
-  const cachePath = getCachePath();
-  if (!fs.existsSync(cachePath)) {
-    return null;
-  }
+function readCacheFromDisk(cachePath: string): MetadataCache | null {
   try {
-    // 修正已有 cache 文件的权限，确保不含 world/group 可读
+    // 修正已有 cache 文件的权限，确保不含 world/group 可读。
+    // chmod 只改 ctime 不改 mtime，不会把下面的快照判断打穿。
     try {
       fs.chmodSync(cachePath, 0o600);
     } catch {}
@@ -43,6 +40,67 @@ export function loadMetadataCache(): MetadataCache | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * 进程内快照：用 mtime + size 判断磁盘上的文件是否还是上次解析的那一份。
+ *
+ * 为什么需要它：`loadMetadataCache()` 的调用点很多，其中 execute_tool 每次调用
+ * 都会经由 locateTool 读一次。cache.json 里有全部工具的完整 inputSchema，
+ * 规模到几百 KB 时，readFileSync + JSON.parse 的开销远大于 statSync。
+ *
+ * 为什么不用"读一次永久缓存"：多个 adapter 进程可能共享同一个工作区（多客户端
+ * 指向同一个 MCP_ADAPTER_HOME），必须能看见别的进程写入的新内容。
+ *
+ * 已知边界：理论上如果文件系统 mtime 精度只有 1 秒，且外部进程恰好在这一秒内
+ * 写出了**字节长度完全相同**的新内容，这里会多用一个旧快照，直到文件再次变化。
+ * 现代文件系统（APFS / ext4）mtime 是纳秒级，实际不可达；且代价只是短暂使用
+ * 略旧的工具目录，不影响正确性。本进程自身的写入会立刻让快照失效，是精确的。
+ *
+ * 另一个契约变化：命中快照时返回的是**同一个对象引用**，多个调用方共享它。
+ * 调用方必须只读，不得修改返回值（当前所有调用点都只读）。
+ */
+let cacheSnapshot: {
+  path: string;
+  mtimeMs: number;
+  size: number;
+  cache: MetadataCache | null;
+} | null = null;
+
+export function loadMetadataCache(): MetadataCache | null {
+  const cachePath = getCachePath();
+
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(cachePath);
+  } catch {
+    // 文件不存在或不可访问：视为无缓存，并且不能让旧快照继续生效
+    cacheSnapshot = null;
+    return null;
+  }
+
+  if (
+    cacheSnapshot &&
+    cacheSnapshot.path === cachePath &&
+    cacheSnapshot.mtimeMs === stat.mtimeMs &&
+    cacheSnapshot.size === stat.size
+  ) {
+    return cacheSnapshot.cache;
+  }
+
+  const cache = readCacheFromDisk(cachePath);
+  cacheSnapshot = {
+    path: cachePath,
+    mtimeMs: stat.mtimeMs,
+    size: stat.size,
+    cache,
+  };
+  return cache;
+}
+
+/** 写盘之后必须调用，保证本进程下一次读取一定拿到最新内容 */
+function invalidateCacheSnapshot(): void {
+  cacheSnapshot = null;
 }
 
 /**
@@ -74,6 +132,8 @@ function doSaveMetadataCache(cache: MetadataCache): void {
     try {
       fs.chmodSync(cachePath, 0o600);
     } catch {}
+    // 与 rename 之间没有 await，所以不存在"已落盘但仍读到旧快照"的窗口
+    invalidateCacheSnapshot();
   } catch (err) {
     if (fs.existsSync(tmpPath)) {
       try {
