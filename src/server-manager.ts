@@ -38,7 +38,9 @@ export interface ServerConnection {
   name: string;
   client: Client;
   transport: Transport;
-  status: "connected" | "connecting" | "closing" | "closed";
+  // 没有 "connecting"：建连期的资源由 pendingResources 持有，
+  // ServerConnection 对象只在连接成功后才诞生
+  status: "connected" | "closing" | "closed";
   lastUsedAt: number;
   inFlight: number;
   /** 已标记退役：不再被复用，等待在途请求排空后物理关闭 */
