@@ -13,14 +13,11 @@ import {
   callTool,
   FAKE_TOOLS,
   fakeServer,
-  flushAdapters,
   startAdapter,
   textOf,
   waitForCache,
 } from "./e2e-harness.js";
 import { delay, waitFor } from "./helpers.js";
-
-after(flushAdapters);
 
 describe("元工具 - 重名冲突、过滤与禁用 (e2e)", () => {
   let adapter: AdapterHandle;

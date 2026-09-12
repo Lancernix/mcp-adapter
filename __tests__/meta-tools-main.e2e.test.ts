@@ -13,15 +13,12 @@ import {
   callTool,
   FAKE_TOOLS,
   fakeServer,
-  flushAdapters,
   META_TOOL_NAMES,
   startAdapter,
   textOf,
   waitForCache,
 } from "./e2e-harness.js";
 import { waitFor } from "./helpers.js";
-
-after(flushAdapters);
 
 /** 从搜索结果里数出实际返回的工具条数（分组标题形如 `### demo (3 matches)`） */
 function countMatches(text: string): number {

@@ -13,14 +13,11 @@ import {
   type AdapterHandle,
   callTool,
   fakeServer,
-  flushAdapters,
   startAdapter,
   textOf,
   waitForCache,
 } from "./e2e-harness.js";
 import { trackTmpDir } from "./helpers.js";
-
-after(flushAdapters);
 
 describe("元工具 - env / inheritEnv / cwd (e2e)", () => {
   const HOST_PROBE = "MCP_ADAPTER_E2E_HOST_PROBE";

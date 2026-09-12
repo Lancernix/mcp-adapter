@@ -12,13 +12,10 @@ import {
   type AdapterHandle,
   callTool,
   fakeServer,
-  flushAdapters,
   startAdapter,
   textOf,
 } from "./e2e-harness.js";
 import { delay, readPids, waitFor } from "./helpers.js";
-
-after(flushAdapters);
 
 describe("元工具 - eager 预热与 keep-alive (e2e)", () => {
   let adapter: AdapterHandle;

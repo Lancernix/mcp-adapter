@@ -11,14 +11,11 @@ import {
   type AdapterHandle,
   callTool,
   fakeServer,
-  flushAdapters,
   startAdapter,
   textOf,
   waitForCache,
 } from "./e2e-harness.js";
 import { readPids } from "./helpers.js";
-
-after(flushAdapters);
 
 describe("元工具 - server 提示指向不可用服务时降级为全局搜索 (e2e)", () => {
   let adapter: AdapterHandle;

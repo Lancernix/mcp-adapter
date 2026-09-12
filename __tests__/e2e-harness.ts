@@ -7,8 +7,8 @@
 //   - process-lifecycle.test.ts 直接操作 McpServerManager，验证并发与资源释放
 //   - e2e 走真实进程 + 真实协议，验证「客户端看到的对外行为」
 //
-// 各 *-e2e.test.ts 文件按关注点分组引用本文件。每个测试文件必须自带一行
-// 文件级 `after(flushAdapters)` 兜底回收（原因见 flushAdapters 的注释）。
+// 各 *-e2e.test.ts 文件按关注点分组引用本文件。adapter 的兜底回收由本文件
+// 自动注册（见下方 runningAdapters 的注释），测试文件无需自己写 after。
 //
 // 前置依赖：仅需 node_modules（tsx 作为 TS 加载器），不依赖网络与真实 MCP 服务。
 
@@ -16,6 +16,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { after } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import {
@@ -29,6 +30,28 @@ import {
 
 const TSX_CLI = path.join(ROOT, "node_modules", "tsx", "dist", "cli.mjs");
 const ADAPTER_ENTRY = path.join(ROOT, "src", "index.ts");
+
+/**
+ * 所有启动过的 adapter 都登记在这里，由本文件的文件级 after 兜底回收。
+ * 只在用例正常走到末尾时靠 suite 的 after 收尾是不够的：断言失败会直接跳过
+ * 后面的代码，adapter 与它的子进程就会残留，进而把这个测试进程挂住、
+ * 报告不出失败原因。兜底回收保证"用例失败"永远只是失败，不是卡死。
+ *
+ * 注册发生在 harness 模块求值时：harness 被每个 e2e 测试文件导入，此时正处于
+ * 该文件的 root suite 收集阶段，这里的 after 会挂到**每个导入方文件**上——
+ * 各 e2e 文件因此不需要（也不能再靠）自己记得写 after(flushAdapters)。
+ *
+ * 验证 hook 是否生效，不能用"跑完无残留进程"作判据：adapter 的死亡守卫会在
+ * 测试进程退出后自行收尾，无残留无论 hook 是否生效都成立。要用留痕法——
+ * 临时在本函数里写一个标记文件，数调用它的测试进程数（应为 e2e 文件数）。
+ */
+const runningAdapters = new Set<AdapterHandle>();
+
+async function flushAdapters(): Promise<void> {
+  await Promise.all([...runningAdapters].map((adapter) => adapter.stop()));
+}
+
+after(flushAdapters);
 
 export const META_TOOL_NAMES = [
   "search_tools",
@@ -186,19 +209,6 @@ export async function startAdapter(
 
   runningAdapters.add(handle);
   return handle;
-}
-
-/**
- * 所有启动过的 adapter 都登记在这里，由各测试文件的文件级 after 兜底回收。
- * 只在用例正常走到末尾时靠 suite 的 after 收尾是不够的：断言失败会直接跳过
- * 后面的代码，adapter 与它的子进程就会残留，进而把这个测试进程挂住、
- * 报告不出失败原因。兜底回收保证"用例失败"永远只是失败，不是卡死。
- */
-const runningAdapters = new Set<AdapterHandle>();
-
-/** 每个测试文件的文件级 `after(flushAdapters)` 调用它，兜底回收所有 adapter */
-export async function flushAdapters(): Promise<void> {
-  await Promise.all([...runningAdapters].map((adapter) => adapter.stop()));
 }
 
 export interface ToolResultLike {

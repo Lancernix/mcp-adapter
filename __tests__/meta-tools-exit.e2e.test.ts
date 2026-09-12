@@ -10,14 +10,11 @@ import {
   type AdapterHandle,
   callTool,
   fakeServer,
-  flushAdapters,
   startAdapter,
   textOf,
   waitForCache,
 } from "./e2e-harness.js";
 import { delay, isAlive, waitFor } from "./helpers.js";
-
-after(flushAdapters);
 
 describe("元工具 - 缓存有效时不产生额外进程 (e2e)", () => {
   let adapter: AdapterHandle;
